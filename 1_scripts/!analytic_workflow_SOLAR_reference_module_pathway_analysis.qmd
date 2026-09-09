@@ -1,0 +1,576 @@
+---
+title: "SOLAR Reference Module Pathway Analysis"
+author: "Zhenjiang Li"
+date: today
+toc: true
+toc_expand: 2
+format:
+  html:
+    code-fold: true
+    html-math-method: katex
+    fontsize: 16pt
+    grid:
+      sidebar-width: 0px
+      body-width: 1500px
+      margin-width: 500px
+      gutter-width: 1.5rem
+embed-resources: true
+editor: visual
+editor_options:
+  chunk_output_type: console
+---
+
+## Environment Setup {.hidden}
+
+```{=html}
+<style type="text/css">
+caption, .table-caption {
+  text-align: left;
+}
+</style>
+```
+
+```{r setup}
+#| echo: false
+
+options(scipen = 999)
+
+library(fs)
+library(here)
+i_am("1_scripts/!analytic_workflow_SOLAR_reference_module_pathway_analysis.qmd")
+
+source(fs::path("1_scripts", "!libraries.R"))
+source(fs::path("1_scripts", "!directories.R"))
+source(fs::path("1_scripts", "!functions.R"))
+
+options(knitr.table.format = "html")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+#| label: shorten-long-path
+#| include: false
+
+create_shortcut <- function(path, short_cut, drive) {
+  sub(gsub("\\)", "\\\\)", gsub("\\(", "\\\\(", short_cut)), paste0(drive, ":"), path)
+}
+
+if (nchar(dir_data) > 80) {
+  system("subst x: /D")
+  short_cut <- dirname(dir_home)
+  system(paste0("subst x: \"", short_cut, "\""))
+
+  dir_objects_names <- ls(pattern = "^dir_")
+  dir_list <- mget(dir_objects_names)
+  dir_list_shortened <- lapply(dir_list, function(y) create_shortcut(y, short_cut, "x"))
+  list2env(dir_list_shortened, envir = .GlobalEnv)
+}
+
+rm(list = intersect(c("dir_objects_names", "short_cut", "dir_list", "dir_list_shortened"), ls()))
+```
+
+# Parameters
+
+```{r parameters}
+reactome_p_cutoff <- 0.05
+reactome_fdr_cutoff <- 0.20
+reactome_min_genes <- 3
+reactome_top_terms_per_module <- 10
+```
+
+# Data
+
+```{r load-data}
+dir_wgcna <- fs::path(dir_temp_data, "WGCNA")
+
+SOLAR_WGCNA_model <- readRDS(fs::path(dir_wgcna, "SOLAR_WGCNA_model.rds"))
+
+proteomics_l <- readRDS(fs::path(
+  dir_data,
+  "ShARP_BHRC_Shared",
+  "ShARP_BHRC_Data_Shared",
+  "OLINK_proteomics_bridged_BHRC_SOLAR_CHS.rds"
+))
+```
+
+```{r module-protein-inputs}
+SOLAR_module_order <- SOLAR_WGCNA_model$reference$module_overview %>%
+  dplyr::filter(module != "grey") %>%
+  dplyr::arrange(dplyr::desc(n_proteins), module) %>%
+  dplyr::mutate(module_label = paste0("M", dplyr::row_number()))
+
+SOLAR_protein_labels <- proteomics_l$protein_annotation$SOLAR %>%
+  dplyr::transmute(
+    protein = meta_id,
+    protein_symbol = dplyr::coalesce(meta_Assay, meta_id)
+  ) %>%
+  dplyr::distinct(protein, .keep_all = TRUE)
+
+SOLAR_reference_module_proteins <- SOLAR_WGCNA_model$reference$wgcna$module_df %>%
+  dplyr::filter(module != "grey") %>%
+  dplyr::left_join(SOLAR_module_order, by = "module") %>%
+  dplyr::left_join(SOLAR_protein_labels, by = "protein") %>%
+  dplyr::mutate(
+    module_label = factor(module_label, levels = SOLAR_module_order$module_label),
+    protein_symbol = dplyr::coalesce(protein_symbol, protein)
+  )
+
+SOLAR_reference_module_proteins %>%
+  dplyr::count(module_label, module, name = "n_proteins") %>%
+  dplyr::arrange(module_label) %>%
+  dplyr::select(
+    `Module` = module_label,
+    `Module color` = module,
+    `Proteins in module` = n_proteins
+  ) %>%
+  kableExtra::kbl(caption = "SOLAR reference WGCNA modules included in pathway analysis.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+# Protein Identifier Mapping
+
+```{r map-proteins}
+SOLAR_reference_entrez_map <- map_proteins_to_entrez(
+  SOLAR_reference_module_proteins$protein_symbol,
+  from_type = "SYMBOL"
+) %>%
+  dplyr::mutate(ENTREZID = as.character(ENTREZID))
+
+SOLAR_reference_module_entrez <- SOLAR_reference_module_proteins %>%
+  dplyr::left_join(
+    SOLAR_reference_entrez_map,
+    by = c("protein_symbol" = "SYMBOL")
+  )
+
+SOLAR_reference_module_entrez %>%
+  dplyr::summarise(
+    n_module_proteins = dplyr::n_distinct(protein),
+    n_mapped_proteins = dplyr::n_distinct(protein[!is.na(ENTREZID)]),
+    pct_mapped = 100 * n_mapped_proteins / n_module_proteins
+  ) %>%
+  kableExtra::kbl(
+    digits = 1,
+    caption = "Entrez ID mapping summary for SOLAR reference module proteins."
+  ) %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+
+SOLAR_reference_module_entrez %>%
+  dplyr::group_by(module_label, module) %>%
+  dplyr::summarise(
+    n_module_proteins = dplyr::n_distinct(protein),
+    n_mapped_proteins = dplyr::n_distinct(protein[!is.na(ENTREZID)]),
+    pct_mapped = 100 * n_mapped_proteins / n_module_proteins,
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(module_label) %>%
+  dplyr::select(
+    `Module` = module_label,
+    `Module color` = module,
+    `Proteins in module` = n_module_proteins,
+    `Proteins mapped to Entrez ID` = n_mapped_proteins,
+    `% mapped` = pct_mapped
+  ) %>%
+  kableExtra::kbl(
+    digits = 1,
+    caption = "Protein identifier mapping by SOLAR reference WGCNA module."
+  ) %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+# Reactome Enrichment
+
+```{r reactome-enrichment}
+SOLAR_reference_reactome_results <- purrr::map_dfr(
+  levels(SOLAR_reference_module_entrez$module_label),
+  function(current_module_label) {
+    module_df <- SOLAR_reference_module_entrez %>%
+      dplyr::filter(module_label == current_module_label)
+
+    module_name <- paste(unique(module_df$module), collapse = ", ")
+
+    run_reactome_enrichment_entrez(
+      df = module_df,
+      universe_df = SOLAR_reference_module_entrez,
+      group_name = current_module_label,
+      entrez_col = "ENTREZID",
+      p_cutoff = reactome_p_cutoff,
+      padj_cutoff = reactome_fdr_cutoff,
+      min_genes = reactome_min_genes
+    ) %>%
+      dplyr::mutate(
+        module_label = current_module_label,
+        module = module_name,
+        .before = enrichment_group
+      )
+  }
+)
+
+reactome_required_columns <- list(
+  ID = NA_character_,
+  Description = NA_character_,
+  GeneRatio = NA_character_,
+  BgRatio = NA_character_,
+  pvalue = NA_real_,
+  p.adjust = NA_real_,
+  geneID = NA_character_,
+  RichFactor = NA_real_,
+  sig_p = NA,
+  sig_fdr = NA,
+  Description_clean = NA_character_
+)
+
+for (column_name in names(reactome_required_columns)) {
+  if (!column_name %in% names(SOLAR_reference_reactome_results)) {
+    SOLAR_reference_reactome_results[[column_name]] <- reactome_required_columns[[column_name]]
+  }
+}
+
+SOLAR_reference_reactome_summary <- SOLAR_reference_reactome_results %>%
+  dplyr::group_by(module_label, module) %>%
+  dplyr::summarise(
+    n_input = max(n_input, na.rm = TRUE),
+    n_reactome_terms = sum(!is.na(ID)),
+    n_terms_p_lt_0_05 = sum(sig_p, na.rm = TRUE),
+    n_terms_fdr_lt_0_05 = sum(p.adjust < 0.05, na.rm = TRUE),
+    n_terms_fdr_lt_0_20 = sum(sig_fdr, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(module_label)
+
+SOLAR_reference_reactome_summary %>%
+  dplyr::select(
+    `Module` = module_label,
+    `Module color` = module,
+    `Mapped input genes` = n_input,
+    `Reactome terms tested` = n_reactome_terms,
+    `Terms with p < 0.05` = n_terms_p_lt_0_05,
+    `Terms with FDR < 0.05` = n_terms_fdr_lt_0_05,
+    `Terms with FDR < 0.20` = n_terms_fdr_lt_0_20
+  ) %>%
+  kableExtra::kbl(caption = "Reactome pathway enrichment summary by SOLAR reference WGCNA module.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+```{r top-reactome-terms}
+SOLAR_reference_reactome_top_terms <- SOLAR_reference_reactome_results %>%
+  dplyr::filter(!is.na(ID)) %>%
+  dplyr::group_by(module_label, module) %>%
+  dplyr::arrange(p.adjust, pvalue, .by_group = TRUE) %>%
+  dplyr::slice_head(n = reactome_top_terms_per_module) %>%
+  dplyr::ungroup()
+
+SOLAR_reference_reactome_top_terms %>%
+  dplyr::select(
+    `Module` = module_label,
+    `Module color` = module,
+    `Reactome pathway` = Description,
+    `Input genes / pathway genes` = GeneRatio,
+    `Background ratio` = BgRatio,
+    `P value` = pvalue,
+    `FDR` = p.adjust,
+    `Input proteins` = geneID
+  ) %>%
+  kableExtra::kbl(
+    digits = 3,
+    caption = "Top Reactome pathways enriched within each SOLAR reference WGCNA module."
+  ) %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+# Visualization
+
+```{r reactome-dotplot, fig.width=11, fig.height=8}
+SOLAR_reference_reactome_plot_modules <- c("M3", "M5", "M6", "M8")
+SOLAR_reference_reactome_plot_fdr_cutoff <- 0.05
+
+reactome_scalar <- function(x, default = NA_character_) {
+  if (is.null(x) || length(x) == 0) {
+    return(default)
+  }
+  as.character(x[[1]])
+}
+
+get_reactome_event_hierarchy <- function(species_id = 9606) {
+  empty_hierarchy <- list(
+    nodes = tibble::tibble(id = character(), name = character()),
+    edges = tibble::tibble(parent_id = character(), child_id = character()),
+    available = FALSE
+  )
+
+  if (!requireNamespace("jsonlite", quietly = TRUE)) {
+    return(empty_hierarchy)
+  }
+
+  hierarchy_url <- paste0(
+    "https://reactome.org/ContentService/data/eventsHierarchy/",
+    species_id
+  )
+
+  hierarchy_tree <- tryCatch(
+    jsonlite::fromJSON(hierarchy_url, simplifyVector = FALSE),
+    error = function(e) NULL
+  )
+
+  if (is.null(hierarchy_tree)) {
+    return(empty_hierarchy)
+  }
+
+  nodes <- list()
+  edges <- list()
+
+  walk_reactome_node <- function(node, parent_id = NA_character_) {
+    node_id <- reactome_scalar(node$stId)
+    node_name <- reactome_scalar(node$name)
+
+    if (!is.na(node_id)) {
+      nodes[[length(nodes) + 1]] <<- tibble::tibble(id = node_id, name = node_name)
+
+      if (!is.na(parent_id)) {
+        edges[[length(edges) + 1]] <<- tibble::tibble(parent_id = parent_id, child_id = node_id)
+      }
+    }
+
+    if (!is.null(node$children) && length(node$children) > 0) {
+      purrr::walk(node$children, walk_reactome_node, parent_id = node_id)
+    }
+  }
+
+  purrr::walk(hierarchy_tree, walk_reactome_node)
+
+  list(
+    nodes = dplyr::bind_rows(nodes) %>% dplyr::distinct(),
+    edges = dplyr::bind_rows(edges) %>% dplyr::distinct(),
+    available = length(nodes) > 0 && length(edges) > 0
+  )
+}
+
+get_reactome_descendant_ids <- function(edges, ancestor_id) {
+  descendant_ids <- character()
+  frontier <- ancestor_id
+
+  while (length(frontier) > 0) {
+    child_ids <- unique(edges$child_id[edges$parent_id %in% frontier])
+    child_ids <- setdiff(child_ids, c(descendant_ids, ancestor_id))
+    descendant_ids <- union(descendant_ids, child_ids)
+    frontier <- child_ids
+  }
+
+  descendant_ids
+}
+
+remove_parent_reactome_terms_by_genes <- function(df) {
+  if (nrow(df) <= 1) {
+    return(rep(FALSE, nrow(df)))
+  }
+
+  gene_sets <- stringr::str_split(df$geneID, "/")
+  drop_parent <- rep(FALSE, nrow(df))
+
+  for (parent_index in seq_len(nrow(df))) {
+    parent_genes <- gene_sets[[parent_index]]
+
+    for (child_index in seq_len(nrow(df))) {
+      child_genes <- gene_sets[[child_index]]
+
+      if (
+        parent_index != child_index &&
+          length(parent_genes) > length(child_genes) &&
+          all(child_genes %in% parent_genes)
+      ) {
+        drop_parent[parent_index] <- TRUE
+        break
+      }
+    }
+  }
+
+  drop_parent
+}
+
+reactome_hierarchy <- get_reactome_event_hierarchy()
+
+infectious_disease_ids <- reactome_hierarchy$nodes %>%
+  dplyr::filter(name == "Infectious disease") %>%
+  dplyr::pull(id)
+
+infectious_disease_descendant_ids <- unique(c(
+  infectious_disease_ids,
+  purrr::map(infectious_disease_ids, ~ get_reactome_descendant_ids(reactome_hierarchy$edges, .x)) %>%
+    unlist(use.names = FALSE)
+))
+
+annotate_reactome_plot_exclusions <- function(df) {
+  if (nrow(df) == 0) {
+    return(df)
+  }
+
+  if (isTRUE(reactome_hierarchy$available)) {
+    child_pathways <- purrr::map_chr(
+      df$ID,
+      function(pathway_id) {
+        child_ids_in_module <- intersect(
+          get_reactome_descendant_ids(reactome_hierarchy$edges, pathway_id),
+          setdiff(df$ID, pathway_id)
+        )
+
+        paste(df$Description_clean[match(child_ids_in_module, df$ID)], collapse = "; ")
+      }
+    )
+
+    remove_parent_pathway <- child_pathways != ""
+    parent_filter_source <- "Reactome hierarchy"
+  } else {
+    remove_parent_pathway <- remove_parent_reactome_terms_by_genes(df)
+    child_pathways <- rep(NA_character_, nrow(df))
+    parent_filter_source <- "Input-gene containment fallback"
+  }
+
+  remove_infectious_disease <- df$ID %in% infectious_disease_descendant_ids
+  infectious_filter_source <- "Reactome Disease > Infectious disease hierarchy"
+
+  df %>%
+    dplyr::mutate(
+      remove_parent_pathway = remove_parent_pathway,
+      child_pathways_in_module = child_pathways,
+      parent_filter_source = parent_filter_source,
+      remove_infectious_disease = remove_infectious_disease,
+      infectious_filter_source = infectious_filter_source,
+      remove_from_plot = remove_parent_pathway | remove_infectious_disease,
+      removal_reason = dplyr::case_when(
+        remove_parent_pathway & remove_infectious_disease ~ "Parent pathway; infectious disease pathway",
+        remove_parent_pathway ~ "Parent pathway",
+        remove_infectious_disease ~ "Infectious disease pathway",
+        TRUE ~ NA_character_
+      )
+    )
+}
+
+SOLAR_reference_reactome_terms_plot_candidates <- SOLAR_reference_reactome_results %>%
+  dplyr::filter(
+    module_label %in% SOLAR_reference_reactome_plot_modules,
+    !is.na(ID),
+    p.adjust < SOLAR_reference_reactome_plot_fdr_cutoff
+  ) %>%
+  dplyr::group_by(module_label) %>%
+  dplyr::group_modify(~ annotate_reactome_plot_exclusions(.x)) %>%
+  dplyr::ungroup()
+
+reactome_plot_annotation_columns <- list(
+  remove_parent_pathway = logical(),
+  child_pathways_in_module = character(),
+  parent_filter_source = character(),
+  remove_infectious_disease = logical(),
+  infectious_filter_source = character(),
+  remove_from_plot = logical(),
+  removal_reason = character()
+)
+
+for (column_name in names(reactome_plot_annotation_columns)) {
+  if (!column_name %in% names(SOLAR_reference_reactome_terms_plot_candidates)) {
+    SOLAR_reference_reactome_terms_plot_candidates[[column_name]] <-
+      reactome_plot_annotation_columns[[column_name]]
+  }
+}
+
+SOLAR_reference_reactome_terms_removed_from_plot <- SOLAR_reference_reactome_terms_plot_candidates %>%
+  dplyr::filter(remove_from_plot)
+
+SOLAR_reference_reactome_terms_plot <- SOLAR_reference_reactome_terms_plot_candidates %>%
+  dplyr::filter(!remove_from_plot) %>%
+  dplyr::mutate(
+    module_label = factor(module_label, levels = SOLAR_reference_reactome_plot_modules),
+    Description_short = stringr::str_wrap(Description_clean, width = 45),
+    neg_log10_fdr = -log10(pmax(p.adjust, .Machine$double.xmin)),
+    Description_short = forcats::fct_reorder(Description_short, neg_log10_fdr, .fun = max)
+  )
+
+tibble::tibble(
+  `Reactome hierarchy available` = reactome_hierarchy$available,
+  `Infectious disease Reactome IDs found` = paste(infectious_disease_ids, collapse = "; "),
+  `Infectious disease descendants found` = length(infectious_disease_descendant_ids)
+) %>%
+  kableExtra::kbl(caption = "Reactome hierarchy filtering status.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+
+SOLAR_reference_reactome_terms_removed_from_plot %>%
+  dplyr::arrange(module_label, removal_reason, p.adjust, pvalue) %>%
+  dplyr::select(
+    `Module` = module_label,
+    `Reactome pathway` = Description_clean,
+    `Reactome ID` = ID,
+    `Removal reason` = removal_reason,
+    `Child pathways in same module` = child_pathways_in_module,
+    `Parent filter source` = parent_filter_source,
+    `Infectious filter source` = infectious_filter_source,
+    `FDR` = p.adjust,
+    `P value` = pvalue
+  ) %>%
+  kableExtra::kbl(
+    digits = 3,
+    caption = "Reactome pathways filtered out before plotting."
+  ) %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+
+SOLAR_reference_reactome_terms_plot %>%
+  dplyr::arrange(module_label, p.adjust, pvalue) %>%
+  dplyr::select(
+    `Module` = module_label,
+    `Reactome pathway kept for plot` = Description_clean,
+    `Reactome ID` = ID,
+    `FDR` = p.adjust,
+    `P value` = pvalue
+  ) %>%
+  kableExtra::kbl(
+    digits = 3,
+    caption = "Reactome pathways retained for plotting after filtering."
+  ) %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+
+if (nrow(SOLAR_reference_reactome_terms_plot) == 0) {
+  ggplot2::ggplot() +
+    ggplot2::annotate(
+      "text",
+      x = 0,
+      y = 0,
+      label = paste0(
+        "No Reactome pathways with FDR < ",
+        SOLAR_reference_reactome_plot_fdr_cutoff,
+        " returned for the selected modules."
+      )
+    ) +
+    ggplot2::theme_void()
+} else {
+  SOLAR_reference_reactome_terms_plot %>%
+    ggplot2::ggplot(ggplot2::aes(
+      x = neg_log10_fdr,
+      y = Description_short,
+      size = RichFactor
+    )) +
+    ggplot2::geom_point(alpha = 0.85, color = "black") +
+    ggplot2::facet_grid(module_label ~ ., scales = "free_y", space = "free_y") +
+    ggplot2::scale_size_continuous(name = "Rich factor", range = c(1, 4)) +
+    ggplot2::labs(
+      x = "-log10(BH-FDR)",
+      y = NULL
+    ) +
+    ggplot2::theme_bw(base_size = 10) +
+    ggplot2::theme(
+      text = ggplot2::element_text(color = "black"),
+      panel.grid.major.y = ggplot2::element_line(color = "grey90", linewidth = 0.2),
+      panel.grid.minor = ggplot2::element_blank(),
+      legend.position = "right",
+      strip.text.y = ggplot2::element_text(angle = 0)
+    )
+}
+```
+
+```{r}
+#| eval: false
+ggsave(
+  filename = fs::path(
+    dir_figures,
+    "SOLAR_ref_module_pathway_analysis.png"
+  ),
+  get_last_plot(),
+  width = 6, height = 2.5, units = "in", dpi = 300
+)
+```

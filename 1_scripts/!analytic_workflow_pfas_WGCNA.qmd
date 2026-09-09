@@ -1,0 +1,1449 @@
+---
+title: "PFAS Associations with WGCNA Modules"
+author: "Zhenjiang Li"
+date: today
+toc: true
+toc_expand: 2
+format:
+  html:
+    code-fold: true
+    html-math-method: katex
+    fontsize: 16pt
+    grid:
+      sidebar-width: 0px
+      body-width: 1500px
+      margin-width: 500px
+      gutter-width: 1.5rem
+embed-resources: true
+editor: visual
+editor_options:
+  chunk_output_type: console
+---
+
+## Environment Setup {.hidden}
+
+```{=html}
+<style type="text/css">
+caption, .table-caption {
+  text-align: left;
+}
+</style>
+```
+
+```{r setup}
+#| echo: false
+
+options(scipen = 999)
+
+library(fs)
+library(here)
+i_am("1_scripts/!analytic_workflow_pfas_WGCNA.qmd")
+
+source(fs::path("1_scripts", "!libraries.R"))
+source(fs::path("1_scripts", "!directories.R"))
+source(fs::path("1_scripts", "!functions.R"))
+
+options(knitr.table.format = "html")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+```{r}
+#| label: shorten-long-path
+#| include: false
+
+create_shortcut <- function(path, short_cut, drive) {
+  return(
+    sub(gsub("\\)", "\\\\)", gsub("\\(", "\\\\(", short_cut)), paste0(drive, ":"), path)
+  )
+}
+
+if (nchar(dir_data) > 80) {
+  system("subst x: /D")
+  short_cut <- dir_home |> dirname()
+  system(paste0("subst x: \"", short_cut, "\""))
+
+  dir_objects_names <- ls(pattern = "^dir_")
+  dir_list <- mget(dir_objects_names)
+
+  dir_list_shortened <- lapply(
+    dir_list,
+    function(y) create_shortcut(y, short_cut, "x")
+  )
+  list2env(dir_list_shortened, envir = .GlobalEnv)
+}
+
+rm(list = intersect(
+  c("dir_objects_names", "short_cut", "dir_list", "dir_list_shortened"),
+  ls()
+))
+```
+
+# Parameters
+
+```{r}
+cohort_names <- c("SOLAR", "CHS", "BHRC")
+
+SOLAR_pfas_names <- c("pfos_log2", "pfoa_log2", "pfna_log2", "pfda_log2", "pfhxs_log2", "pfhps_log2")
+CHS_pfas_names <- c("ma_pfos_log2", "ma_pfoa_log2", "ma_pfna_log2", "ma_pfda_log2", "ma_pfhxs_log2", "ma_pfhps_log2")
+BHRC_pfas_names <- c("PFOS_det60_imputed_log2", "PFOA_det60_imputed_log2", "PFNA_det60_imputed_log2", "PFDA_det60_imputed_log2", "PFHxS_det60_imputed_log2", "PFHpS_det60_imputed_log2")
+PFAS_abbrev_names <- c("PFOS", "PFOA", "PFNA", "PFDA", "PFHxS", "PFHpS")
+
+SOLAR_covars <- c("age", "sex", "bmiz", "tanner", "wave", "edu_house2")
+CHS_covars <- c("ma_age", "ma_sex", "ma_hisp", "ma_parental_edu", "ma_bmi")
+BHRC_raw_covars <- c("AGE_AT_VISIT", "BMI1", "GENDER", "YEARS_EDU", "ADA2010_DM")
+BHRC_covars <- c("AGE_AT_VISIT", "BMI1", "GENDER", "edu_3level", "ADA2010_DM")
+
+qgcomp_boot_B <- 500
+qgcomp_seed <- 20260101
+
+dir_wgcna <- fs::path(dir_temp_data, "WGCNA")
+fs::dir_create(dir_wgcna)
+```
+
+# Data Preparation
+
+## WGCNA models
+
+```{r load-wgcna-models}
+SOLAR_WGCNA_model <- readRDS(fs::path(dir_wgcna, "SOLAR_WGCNA_model.rds"))
+```
+
+## Cohort identifiers
+
+```{r cohort-identifiers}
+proteomics_l <- readRDS(fs::path(
+  dir_data,
+  "ShARP_BHRC_Shared",
+  "ShARP_BHRC_Data_Shared",
+  "OLINK_proteomics_bridged_BHRC_SOLAR_CHS.rds"
+))
+
+SOLAR_id_map <- proteomics_l$SOLAR %>%
+  dplyr::transmute(
+    sample_id = paste("SOLAR", LABID, sep = "_"),
+    id = gsub("-", "_", tolower(LABID))
+  )
+
+CHS_id_link <- readxl::read_xlsx(
+  fs::path(
+    here::here() |> dirname() |> dirname() |> dirname() |> dirname() |> dirname(),
+    "Chatzi Projects and Analyses",
+    "Env Chem SOL-CHS",
+    "Lab Analysis and sample shipments",
+    "Metachem_sample_inventory_master_040522.xlsx"
+  ),
+  sheet = "Plasma"
+) %>%
+  dplyr::transmute(
+    SampleID = `Plasma Aliquot ID`,
+    id = as.character(`Sample Name`)
+  )
+
+CHS_id_map <- proteomics_l$CHS %>%
+  dplyr::transmute(
+    sample_id = paste("CHS", LABID, sep = "_"),
+    SampleID = LABID
+  ) %>%
+  dplyr::left_join(CHS_id_link, by = "SampleID") %>%
+  dplyr::select(sample_id, id)
+
+BHRC_id_map <- proteomics_l$BHRC %>%
+  dplyr::transmute(
+    sample_id = paste("BHRC", LABID, sep = "_"),
+    LABID = LABID
+  )
+```
+
+## PFAS and covariates
+
+```{r pfas-covariates}
+load(fs::path(
+  dir_data,
+  "ShARP_SOLAR_Shared",
+  "ShARP_SOLAR_Data_Shared",
+  "Solar_Analysis_20251003.Rda"
+))
+SOLAR <- analysis_df
+rm(analysis_df)
+
+SOLAR_visit1 <- SOLAR %>%
+  dplyr::group_by(id) %>%
+  dplyr::filter(visit == min(visit)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    edu_house2 = dplyr::recode(
+      edu_house,
+      "Missing" = "Missing",
+      "Did not graduate high school" = "< High School",
+      "High school graduate" = "High School Grad",
+      "Partial college (at least one year) or specialized training" = "> High School",
+      "Completed college/university" = "> High School",
+      "Graduate professional training (graduate degree)" = "> High School"
+    ),
+    dplyr::across(tidyselect::any_of(c("sex", "tanner", "wave", "edu_house2")), as.factor)
+  ) %>%
+  dplyr::select(id, tidyselect::all_of(SOLAR_pfas_names), tidyselect::all_of(SOLAR_covars))
+
+CHS <- readRDS(fs::path(
+  dir_data,
+  "ShARP_CHS_Shared",
+  "ShARP_CHS_Data_Shared",
+  "CHS MetaAir MetaChem Cleaned Redcap and Exposures Outcome Data long V5.rds"
+))
+
+CHS_baseline <- CHS %>%
+  dplyr::filter(study == "MetaAir") %>%
+  dplyr::select(id, tidyselect::all_of(CHS_pfas_names), tidyselect::all_of(CHS_covars)) %>%
+  dplyr::mutate(
+    ma_hisp = as.factor(ma_hisp),
+    # ma_race_eth = as.factor(ma_race_eth),
+    ma_parental_edu = dplyr::na_if(ma_parental_edu, -1),
+    ma_parental_edu = as.factor(ma_parental_edu),
+    ma_sex = as.factor(ma_sex)
+  )
+
+BHRC <- readRDS(
+  fs::path(
+    dir_data,
+    "ShARP_BHRC_Shared",
+    "ShARP_BHRC_Data_Shared",
+    "CCHC_usc250_long_12172025.rds"
+  )
+) %>%
+  dplyr::filter(visit %in% c(1, 2))
+
+BHRC_pfas <- readRDS(
+  fs::path(
+    dir_data,
+    "ShARP_BHRC_Shared",
+    "ShARP_BHRC_Data_Shared",
+    "PFAS_CCHC_three_sets.rds"
+  )
+)
+
+BHRC_analysis_df <- BHRC %>%
+  dplyr::filter(visit == 1) %>%
+  dplyr::select(RRID, LABID, visit, tidyselect::all_of(BHRC_raw_covars)) %>%
+  dplyr::left_join(
+    BHRC_pfas %>%
+      dplyr::select(RRID, tidyselect::all_of(BHRC_pfas_names)),
+    by = "RRID"
+  ) %>%
+  dplyr::mutate(
+    GENDER = as.factor(GENDER),
+    YEARS_EDU_code = code_from_years_edu(YEARS_EDU),
+    edu_3level = bhrc_edu_3level(YEARS_EDU_code),
+    ADA2010_DM = as.factor(ADA2010_DM)
+  ) %>%
+  dplyr::arrange(LABID, visit) %>%
+  dplyr::distinct(LABID, .keep_all = TRUE)
+```
+
+## Modeling helpers
+
+```{r modeling-helpers}
+non_grey_me_names <- function(df) {
+  grep("^ME", names(df), value = TRUE) %>%
+    setdiff("MEgrey")
+}
+
+fit_module_pfas <- function(data, me_name, pfas_name, covars) {
+  model_df <- data %>%
+    dplyr::select(tidyselect::all_of(c(me_name, pfas_name, covars))) %>%
+    dplyr::filter(stats::complete.cases(.))
+
+  module_mean <- mean(model_df[[me_name]], na.rm = TRUE)
+  module_sd <- stats::sd(model_df[[me_name]], na.rm = TRUE)
+
+  if (nrow(model_df) <= length(covars) + 2 || is.na(module_sd) || module_sd == 0) {
+    return(tibble::tibble(
+      module = stringr::str_remove(me_name, "^ME"),
+      pfas = pfas_name,
+      n = nrow(model_df),
+      estimate = NA_real_,
+      std.error = NA_real_,
+      conf.low = NA_real_,
+      conf.high = NA_real_,
+      p.value = NA_real_,
+      module_mean = module_mean,
+      module_sd = module_sd,
+      outcome_scale = "module_eigengene_SD"
+    ))
+  }
+
+  model_df <- model_df %>%
+    dplyr::mutate(module_eigengene_z = (.data[[me_name]] - module_mean) / module_sd)
+
+  tryCatch(
+    {
+      fit <- stats::lm(stats::reformulate(c(pfas_name, covars), response = "module_eigengene_z"), data = model_df)
+
+      broom::tidy(fit, conf.int = TRUE) %>%
+        dplyr::filter(term == pfas_name) %>%
+        dplyr::transmute(
+          module = stringr::str_remove(me_name, "^ME"),
+          pfas = pfas_name,
+          n = nrow(model_df),
+          estimate,
+          std.error,
+          conf.low,
+          conf.high,
+          p.value,
+          module_mean = module_mean,
+          module_sd = module_sd,
+          outcome_scale = "module_eigengene_SD"
+        )
+    },
+    error = function(e) {
+      tibble::tibble(
+        module = stringr::str_remove(me_name, "^ME"),
+        pfas = pfas_name,
+        n = nrow(model_df),
+        estimate = NA_real_,
+        std.error = NA_real_,
+        conf.low = NA_real_,
+        conf.high = NA_real_,
+        p.value = NA_real_,
+        module_mean = module_mean,
+        module_sd = module_sd,
+        outcome_scale = "module_eigengene_SD"
+      )
+    }
+  )
+}
+
+run_module_pfas_models <- function(data,
+                                   me_names,
+                                   pfas_names,
+                                   pfas_abbrev_names,
+                                   covars,
+                                   cohort,
+                                   module_set) {
+  purrr::map_dfr(
+    pfas_names,
+    function(pfas_name) {
+      purrr::map_dfr(
+        me_names,
+        ~ fit_module_pfas(data, .x, pfas_name, covars)
+      ) %>%
+        dplyr::mutate(
+          pfas_abbrev = pfas_abbrev_names[match(pfas_name, pfas_names)]
+        )
+    }
+  ) %>%
+    dplyr::mutate(
+      cohort = cohort,
+      module_set = module_set,
+      p.adjust.BH = p.adjust(p.value, method = "BH"),
+      p.adjust.BY = p.adjust(p.value, method = "BY")
+    ) %>%
+    dplyr::relocate(cohort, module_set, module, pfas, pfas_abbrev, n)
+}
+```
+
+# SOLAR Reference and Projected Modules
+
+```{r solar-reference-projected-module-data}
+SOLAR_reference_MEs <- SOLAR_WGCNA_model$reference$module_eigengenes %>%
+  dplyr::select(-tidyselect::any_of("MEgrey"))
+
+projected_MEs <- SOLAR_WGCNA_model$projection$projected_MEs %>%
+  dplyr::select(-tidyselect::any_of("MEgrey"))
+
+SOLAR_projected_me_names <- non_grey_me_names(SOLAR_reference_MEs)
+
+SOLAR_reference_df <- SOLAR_reference_MEs %>%
+  dplyr::left_join(SOLAR_id_map, by = "sample_id") %>%
+  dplyr::left_join(SOLAR_visit1, by = "id")
+
+CHS_projected_df <- projected_MEs %>%
+  dplyr::filter(cohort == "CHS") %>%
+  dplyr::left_join(CHS_id_map, by = "sample_id") %>%
+  dplyr::left_join(CHS_baseline, by = "id")
+
+BHRC_projected_df <- projected_MEs %>%
+  dplyr::filter(cohort == "BHRC") %>%
+  dplyr::left_join(BHRC_id_map, by = "sample_id") %>%
+  dplyr::left_join(BHRC_analysis_df, by = "LABID")
+
+tibble::tibble(
+  cohort = cohort_names,
+  n_rows = c(nrow(SOLAR_reference_df), nrow(CHS_projected_df), nrow(BHRC_projected_df)),
+  n_modules = length(SOLAR_projected_me_names)
+) %>%
+  kableExtra::kbl(caption = "SOLAR reference and projected module analysis datasets.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+```{r solar-projected-module-pfas-models}
+SOLAR_module_pfas_results <- dplyr::bind_rows(
+  run_module_pfas_models(
+    data = SOLAR_reference_df,
+    me_names = SOLAR_projected_me_names,
+    pfas_names = SOLAR_pfas_names,
+    pfas_abbrev_names = PFAS_abbrev_names,
+    covars = SOLAR_covars,
+    cohort = "SOLAR",
+    module_set = "SOLAR_reference"
+  ),
+  run_module_pfas_models(
+    data = CHS_projected_df,
+    me_names = SOLAR_projected_me_names,
+    pfas_names = CHS_pfas_names,
+    pfas_abbrev_names = PFAS_abbrev_names,
+    covars = CHS_covars,
+    cohort = "CHS",
+    module_set = "SOLAR_projected"
+  ),
+  run_module_pfas_models(
+    data = BHRC_projected_df,
+    me_names = SOLAR_projected_me_names,
+    pfas_names = BHRC_pfas_names,
+    pfas_abbrev_names = PFAS_abbrev_names,
+    covars = BHRC_covars,
+    cohort = "BHRC",
+    module_set = "SOLAR_projected"
+  )
+)
+
+SOLAR_module_pfas_results %>%
+  dplyr::count(cohort, module_set, pfas_abbrev, name = "n_models") %>%
+  kableExtra::kbl(caption = "SOLAR reference and projected module PFAS association models.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+
+sum(SOLAR_module_pfas_results$p.adjust.BH < 0.05)
+sum(SOLAR_module_pfas_results$p.adjust.BH < 0.2)
+SOLAR_module_pfas_results[which(SOLAR_module_pfas_results$p.adjust.BH < 0.2),]
+```
+
+# PFAS Mixture Models
+
+## qgcomp helpers
+
+```{r qgcomp-helpers}
+fit_module_qgcomp <- function(data, me_name, pfas_names, covars, q = 4, B = 500) {
+  model_df <- data %>%
+    dplyr::select(tidyselect::all_of(c(me_name, pfas_names, covars))) %>%
+    dplyr::filter(stats::complete.cases(.))
+
+  module_mean <- mean(model_df[[me_name]], na.rm = TRUE)
+  module_sd <- stats::sd(model_df[[me_name]], na.rm = TRUE)
+
+  empty_result <- tibble::tibble(
+    module = stringr::str_remove(me_name, "^ME"),
+    mixture = "PFAS mixture",
+    n = nrow(model_df),
+    estimate = NA_real_,
+    std.error = NA_real_,
+    conf.low = NA_real_,
+    conf.high = NA_real_,
+    p.value = NA_real_,
+    q = q,
+    B = B,
+    exposure_scale = "original",
+    module_mean = module_mean,
+    module_sd = module_sd,
+    outcome_scale = "module_eigengene_SD",
+    error = NA_character_
+  )
+
+  empty_weights <- tibble::tibble(
+    module = stringr::str_remove(me_name, "^ME"),
+    pfas_log2 = character(),
+    pfas = character(),
+    weight = numeric(),
+    direction = character(),
+    q = integer(),
+    B = integer(),
+    exposure_scale = character()
+  )
+
+  if (nrow(model_df) <= length(c(pfas_names, covars)) + 2 || is.na(module_sd) || module_sd == 0) {
+    return(list(result = empty_result, weights = empty_weights))
+  }
+
+  model_df <- model_df %>%
+    dplyr::mutate(module_eigengene_z = (.data[[me_name]] - module_mean) / module_sd)
+
+  tryCatch(
+    {
+      pfas_original_names <- paste0("qgcomp_original_", seq_along(pfas_names))
+
+      for (i in seq_along(pfas_names)) {
+        model_df[[pfas_original_names[i]]] <- 2^model_df[[pfas_names[i]]]
+      }
+
+      fit <- qgcomp::qgcomp.boot(
+        f = stats::reformulate(c(pfas_original_names, covars), response = "module_eigengene_z"),
+        expnms = pfas_original_names,
+        data = model_df,
+        q = q,
+        B = B,
+        family = gaussian()
+      )
+
+      psi <- as.numeric(fit$psi)
+      se <- sqrt(as.numeric(fit$var.psi))
+
+      result <- tibble::tibble(
+        module = stringr::str_remove(me_name, "^ME"),
+        mixture = "PFAS mixture",
+        n = nrow(model_df),
+        estimate = psi,
+        std.error = se,
+        conf.low = psi - 1.96 * se,
+        conf.high = psi + 1.96 * se,
+        p.value = 2 * stats::pnorm(abs(psi / se), lower.tail = FALSE),
+        q = q,
+        B = B,
+        exposure_scale = "original",
+        module_mean = module_mean,
+        module_sd = module_sd,
+        outcome_scale = "module_eigengene_SD",
+        error = NA_character_
+      )
+
+      if (!is.null(fit$pos.weights) || !is.null(fit$neg.weights)) {
+        weights <- dplyr::bind_rows(
+          tibble::tibble(
+            module = stringr::str_remove(me_name, "^ME"),
+            pfas = names(fit$pos.weights),
+            weight = as.numeric(fit$pos.weights),
+            direction = "Positive",
+            q = q,
+            B = B,
+            exposure_scale = "original"
+          ),
+          tibble::tibble(
+            module = stringr::str_remove(me_name, "^ME"),
+            pfas = names(fit$neg.weights),
+            weight = as.numeric(fit$neg.weights),
+            direction = "Negative",
+            q = q,
+            B = B,
+            exposure_scale = "original"
+          )
+        ) %>%
+          dplyr::filter(!is.na(weight), weight > 0) %>%
+          dplyr::mutate(
+            pfas_log2 = pfas_names[match(pfas, pfas_original_names)]
+          )
+      } else {
+        weights <- empty_weights
+      }
+
+      list(result = result, weights = weights)
+    },
+    error = function(e) {
+      empty_result$error <- conditionMessage(e)
+      list(result = empty_result, weights = empty_weights)
+    }
+  )
+}
+
+run_module_qgcomp_models <- function(data,
+                                     me_names,
+                                     pfas_names,
+                                     pfas_abbrev_names,
+                                     covars,
+                                     cohort,
+                                     module_set,
+                                     q = 4,
+                                     B = qgcomp_boot_B) {
+  fits <- purrr::map(
+    me_names,
+    ~ fit_module_qgcomp(
+      data = data,
+      me_name = .x,
+      pfas_names = pfas_names,
+      covars = covars,
+      q = q,
+      B = B
+    )
+  )
+
+  results <- purrr::map_dfr(fits, "result") %>%
+    dplyr::mutate(
+      cohort = cohort,
+      module_set = module_set,
+      p.adjust.BH = p.adjust(p.value, method = "BH"),
+      p.adjust.BY = p.adjust(p.value, method = "BY")
+    ) %>%
+    dplyr::relocate(cohort, module_set, module, mixture, n)
+
+  weights <- purrr::map_dfr(fits, "weights") %>%
+    dplyr::mutate(
+      cohort = cohort,
+      module_set = module_set,
+      pfas_abbrev = pfas_abbrev_names[match(pfas_log2, pfas_names)]
+    ) %>%
+    dplyr::relocate(cohort, module_set, module, pfas_log2, pfas_abbrev, pfas)
+
+  list(results = results, weights = weights)
+}
+```
+
+## SOLAR reference and projected modules
+
+```{r solar-projected-module-qgcomp-models}
+set.seed(qgcomp_seed)
+
+SOLAR_reference_qgcomp <- run_module_qgcomp_models(
+  data = SOLAR_reference_df,
+  me_names = SOLAR_projected_me_names,
+  pfas_names = SOLAR_pfas_names,
+  pfas_abbrev_names = PFAS_abbrev_names,
+  covars = SOLAR_covars,
+  cohort = "SOLAR",
+  module_set = "SOLAR_reference"
+)
+
+CHS_projected_qgcomp <- run_module_qgcomp_models(
+  data = CHS_projected_df,
+  me_names = SOLAR_projected_me_names,
+  pfas_names = CHS_pfas_names,
+  pfas_abbrev_names = PFAS_abbrev_names,
+  covars = CHS_covars,
+  cohort = "CHS",
+  module_set = "SOLAR_projected"
+)
+
+BHRC_projected_qgcomp <- run_module_qgcomp_models(
+  data = BHRC_projected_df,
+  me_names = SOLAR_projected_me_names,
+  pfas_names = BHRC_pfas_names,
+  pfas_abbrev_names = PFAS_abbrev_names,
+  covars = BHRC_covars,
+  cohort = "BHRC",
+  module_set = "SOLAR_projected"
+)
+
+SOLAR_module_qgcomp_results <- dplyr::bind_rows(
+  SOLAR_reference_qgcomp$results,
+  CHS_projected_qgcomp$results,
+  BHRC_projected_qgcomp$results
+)
+
+SOLAR_module_qgcomp_weights <- dplyr::bind_rows(
+  SOLAR_reference_qgcomp$weights,
+  CHS_projected_qgcomp$weights,
+  BHRC_projected_qgcomp$weights
+)
+
+SOLAR_module_qgcomp_results %>%
+  dplyr::count(cohort, module_set, name = "n_models") %>%
+  kableExtra::kbl(caption = "SOLAR reference and projected module qgcomp PFAS mixture models.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+
+sum(SOLAR_module_qgcomp_results$p.adjust.BH < 0.05)
+sum(SOLAR_module_qgcomp_results$p.adjust.BH < 0.2)
+SOLAR_module_qgcomp_results[which(SOLAR_module_qgcomp_results$p.adjust.BH < 0.2),]
+```
+
+# Heatmap
+
+```{r solar-module-estimate-heatmap}
+SOLAR_module_order <- SOLAR_WGCNA_model$reference$module_overview %>%
+  dplyr::filter(
+    module != "grey",
+    module %in% stringr::str_remove(SOLAR_projected_me_names, "^ME")
+  ) %>%
+  dplyr::arrange(dplyr::desc(n_proteins), module) %>%
+  dplyr::mutate(module_label = paste0("M", dplyr::row_number()))
+
+SOLAR_module_summary <- dplyr::bind_rows(
+  SOLAR_module_pfas_results %>%
+    dplyr::transmute(
+      cohort,
+      module_set,
+      module,
+      exposure = pfas_abbrev,
+      exposure_type = "Individual PFAS",
+      n,
+      estimate,
+      std.error,
+      conf.low,
+      conf.high,
+      p.value,
+      p.adjust.BH,
+      outcome_scale
+    ),
+  SOLAR_module_qgcomp_results %>%
+    dplyr::transmute(
+      cohort,
+      module_set,
+      module,
+      exposure = mixture,
+      exposure_type = "PFAS mixture",
+      n,
+      estimate,
+      std.error,
+      conf.low,
+      conf.high,
+      p.value,
+      p.adjust.BH,
+      outcome_scale
+    )
+) %>%
+  dplyr::left_join(SOLAR_module_order, by = "module") %>%
+  dplyr::mutate(
+    cohort = factor(cohort, levels = cohort_names),
+    module = factor(module, levels = SOLAR_module_order$module),
+    module_label = factor(module_label, levels = SOLAR_module_order$module_label),
+    exposure = factor(exposure, levels = rev(c(PFAS_abbrev_names, "PFAS mixture"))),
+    significance = dplyr::case_when(
+      p.adjust.BH < 0.2 ~ "**",
+      p.value < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+SOLAR_module_summary %>%
+  dplyr::count(cohort, exposure, name = "n_models") %>%
+  kableExtra::kbl(caption = "SOLAR reference/projected module heatmap inputs.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+
+SOLAR_module_order %>%
+  dplyr::select(module_label, module, n_proteins) %>%
+  kableExtra::kbl(caption = "SOLAR reference module labels ordered by module size.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+```{r}
+ggplot2::ggplot(SOLAR_module_summary, ggplot2::aes(x = module_label, y = exposure, fill = estimate)) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.3) +
+  ggplot2::geom_text(ggplot2::aes(label = significance), size = 3) +
+  ggplot2::facet_grid(. ~ cohort, switch = "y") +
+  ggplot2::scale_fill_gradient2(
+    low = "#2C7BB6",
+    mid = "grey99",
+    high = "#D7191C",
+    midpoint = 0,
+    na.value = "grey90",
+    breaks = scales::breaks_pretty(n = 3),
+    name = "SD-unit change in\nmodule eigengene",
+    guide = ggplot2::guide_colorbar(
+      barwidth = grid::unit(1.5, "in"),
+      barheight = grid::unit(0.1, "in"),
+      title.position = "left",
+      title.vjust = 1
+    )
+  ) +
+  ggplot2::labs(
+    x = "SOLAR reference module",
+    y = NULL
+  ) +
+  ggplot2::theme_bw(base_size = 10) +
+  ggplot2::theme(
+    text = ggplot2::element_text(color = "black", size = 10),
+    axis.title = ggplot2::element_text(color = "black", size = 11),
+    axis.text = ggplot2::element_text(color = "black", size = 10),
+    axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, vjust = 1, size = 9),
+    panel.grid = ggplot2::element_blank(),
+    strip.placement = "outside",
+    strip.background.y = ggplot2::element_rect(fill = "grey90", color = NA),
+    strip.text = ggplot2::element_text(color = "black", size = 10),
+    strip.text.y.left = ggplot2::element_text(angle = 90, color = "black", size = 10),
+    legend.title = ggplot2::element_text(
+      color = "black",
+      size = 10,
+      margin = ggplot2::margin(r = 12)
+    ),
+    legend.text = ggplot2::element_text(color = "black", size = 10),
+    legend.position = "bottom",
+    legend.box.margin = ggplot2::margin(t = -6, r = 0, b = 0, l = 0),
+    legend.margin = ggplot2::margin(t = 0, r = 0, b = 0, l = 0),
+    plot.margin = ggplot2::margin(t = 5.5, r = 5.5, b = 0, l = 5.5)
+  )
+```
+
+```{r}
+#| eval: false
+
+ggsave(
+  fs::path(
+    dir_figures,
+    "PFAS_SOLAR_ref_modules_heatmap.png"
+  ),
+  dpi = 600, units = c("in"),
+  width = 5.5, height = 2.5
+)
+```
+
+# Circular Plots
+
+```{r solar-reference-module-circular-network-inputs}
+circular_max_nodes <- 20
+circular_min_TOM <- 0.10
+circular_TOM_threshold_quantile <- 0.90
+circular_adjusted_p_threshold <- 0.20
+circular_nominal_p_threshold <- 0.05
+circular_reactome_n_pathways_to_show <- c(5, 10)
+circular_reactome_broad_pathway_pattern <- paste(
+  c(
+    "^Metabolism$",
+    "^Metabolism of proteins$",
+    # "^Signal Transduction$",
+    "^Immune System$",
+    "^Disease$",
+    "^Developmental Biology$",
+    "^Gene expression \\(Transcription\\)$",
+    # "^Transport of small molecules$",
+    "^Cell Cycle$",
+    "^Hemostasis$",
+    # "^Programmed Cell Death$",
+    # "^Cell-Cell communication$",
+    "^Biological oxidations$",
+    "^Dengue Virus Infection$",
+    "^Dengue Virus-Host Interactions$"
+  ),
+  collapse = "|"
+)
+
+SOLAR_protein_labels <- proteomics_l$protein_annotation$SOLAR %>%
+  dplyr::transmute(
+    protein = meta_id,
+    protein_label = dplyr::coalesce(meta_Assay, meta_id)
+  ) %>%
+  dplyr::distinct(protein, .keep_all = TRUE)
+
+selected_significant_modules <- SOLAR_module_summary %>%
+  dplyr::filter(
+    !is.na(module_label),
+    module != "grey",
+    p.adjust.BH < circular_adjusted_p_threshold | p.value < circular_nominal_p_threshold
+  ) %>%
+  dplyr::distinct(module_label, module, n_proteins) %>%
+  dplyr::mutate(
+    module_label = as.character(module_label),
+    module = as.character(module)
+  ) %>%
+  dplyr::arrange(module_label)
+
+calculate_module_membership <- function(module_name) {
+  module_proteins <- SOLAR_WGCNA_model$reference$wgcna$module_df %>%
+    dplyr::filter(module == module_name) %>%
+    dplyr::pull(protein)
+
+  module_eigengene_name <- paste0("ME", module_name)
+  module_eigengene <- SOLAR_WGCNA_model$reference$wgcna$MEs[[module_eigengene_name]]
+
+  kME <- stats::cor(
+    SOLAR_WGCNA_model$reference$wgcna$datExpr[, module_proteins, drop = FALSE],
+    module_eigengene,
+    use = "pairwise.complete.obs"
+  )[, 1]
+
+  tibble::tibble(
+    protein = names(kME),
+    module = module_name,
+    kME = as.numeric(kME),
+    kME_abs = abs(kME)
+  ) %>%
+    dplyr::left_join(SOLAR_protein_labels, by = "protein") %>%
+    dplyr::mutate(protein_label = dplyr::coalesce(protein_label, protein))
+}
+
+get_reactome_pathways_for_proteins <- function(protein_df) {
+  empty_protein_pathways <- protein_df %>%
+    dplyr::select(protein, protein_label) %>%
+    dplyr::distinct() %>%
+    dplyr::mutate(
+      entrez_id = NA_character_,
+      pathway_id = NA_character_,
+      pathway_name = NA_character_,
+      is_broad_pathway = NA
+    )
+
+  if (!requireNamespace("ReactomePA", quietly = TRUE)) {
+    return(empty_protein_pathways)
+  }
+
+  entrez_map <- tryCatch(
+    map_proteins_to_entrez(protein_df$protein_label, from_type = "SYMBOL") %>%
+      dplyr::transmute(
+        protein_label = SYMBOL,
+        entrez_id = as.character(ENTREZID)
+      ),
+    error = function(e) tibble::tibble()
+  )
+
+  if (nrow(entrez_map) == 0) {
+    return(empty_protein_pathways)
+  }
+
+  protein_entrez_df <- protein_df %>%
+    dplyr::select(protein, protein_label) %>%
+    dplyr::distinct() %>%
+    dplyr::left_join(entrez_map, by = "protein_label")
+
+  input_genes <- protein_entrez_df %>%
+    dplyr::filter(!is.na(entrez_id), entrez_id != "") %>%
+    dplyr::distinct(entrez_id) %>%
+    dplyr::pull(entrez_id)
+
+  if (length(input_genes) == 0) {
+    return(empty_protein_pathways)
+  }
+
+  reactome_obj <- tryCatch(
+    ReactomePA::enrichPathway(
+      gene = input_genes,
+      organism = "human",
+      pvalueCutoff = 1,
+      pAdjustMethod = "BH",
+      qvalueCutoff = 1,
+      readable = FALSE
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(reactome_obj)) {
+    return(empty_protein_pathways)
+  }
+
+  reactome_df <- as.data.frame(reactome_obj)
+
+  if (nrow(reactome_df) == 0) {
+    return(empty_protein_pathways)
+  }
+
+  reactome_gene_pathways <- reactome_df %>%
+    tibble::as_tibble() %>%
+    dplyr::transmute(
+      pathway_id = ID,
+      pathway_name = Description,
+      entrez_id = geneID
+    ) %>%
+    tidyr::separate_rows(entrez_id, sep = "/") %>%
+    dplyr::mutate(
+      is_broad_pathway = stringr::str_detect(pathway_name, circular_reactome_broad_pathway_pattern)
+    ) %>%
+    dplyr::distinct(entrez_id, pathway_id, pathway_name, is_broad_pathway)
+
+  protein_entrez_df %>%
+    dplyr::left_join(reactome_gene_pathways, by = "entrez_id")
+}
+
+select_reactome_pathways_to_keep <- function(pathway_assignments) {
+  kept_pathways <- pathway_assignments %>%
+    dplyr::filter(!is.na(pathway_name), !is_broad_pathway) %>%
+    dplyr::distinct(protein, pathway_id, pathway_name) %>%
+    dplyr::count(pathway_id, pathway_name, name = "n_selected_proteins") %>%
+    dplyr::filter(n_selected_proteins > 1) %>%
+    dplyr::arrange(dplyr::desc(n_selected_proteins), pathway_name) %>%
+    dplyr::slice_head(n = circular_reactome_n_pathways_to_show[[2]])
+
+  if (nrow(kept_pathways) < circular_reactome_n_pathways_to_show[[1]]) {
+    kept_pathways <- pathway_assignments %>%
+      dplyr::filter(!is.na(pathway_name)) %>%
+      dplyr::distinct(protein, pathway_id, pathway_name) %>%
+      dplyr::count(pathway_id, pathway_name, name = "n_selected_proteins") %>%
+      dplyr::filter(n_selected_proteins > 1) %>%
+      dplyr::arrange(dplyr::desc(n_selected_proteins), pathway_name) %>%
+      dplyr::slice_head(n = circular_reactome_n_pathways_to_show[[2]])
+  }
+
+  kept_pathways
+}
+
+assign_reactome_pathways_to_proteins <- function(protein_df,
+                                                 pathway_assignments,
+                                                 kept_pathways) {
+  if (nrow(pathway_assignments) == 0) {
+    return(protein_df %>% dplyr::mutate(
+      reactome_pathway_id = NA_character_,
+      reactome_pathway = "Other/unique Reactome pathways"
+    ))
+  }
+
+  if (all(is.na(pathway_assignments$pathway_name))) {
+    return(protein_df %>% dplyr::mutate(
+      reactome_pathway_id = NA_character_,
+      reactome_pathway = "Other/unique Reactome pathways"
+    ))
+  }
+
+  if (nrow(kept_pathways) == 0) {
+    return(protein_df %>% dplyr::mutate(
+      reactome_pathway_id = NA_character_,
+      reactome_pathway = "Other/unique Reactome pathways"
+    ))
+  }
+
+  selected_pathway_assignments <- pathway_assignments %>%
+    dplyr::inner_join(kept_pathways, by = c("pathway_id", "pathway_name")) %>%
+    dplyr::group_by(protein) %>%
+    dplyr::arrange(dplyr::desc(n_selected_proteins), pathway_name, .by_group = TRUE) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      reactome_pathway_id = pathway_id,
+      reactome_pathway = pathway_name
+    ) %>%
+    dplyr::select(protein, reactome_pathway_id, reactome_pathway)
+
+  protein_df %>%
+    dplyr::left_join(selected_pathway_assignments, by = "protein") %>%
+    dplyr::mutate(
+      reactome_pathway = dplyr::case_when(
+        protein %in% pathway_assignments$protein[!is.na(pathway_assignments$pathway_name)] &
+          is.na(reactome_pathway) ~ "Other/unique Reactome pathways",
+        TRUE ~ dplyr::coalesce(reactome_pathway, "Other/unique Reactome pathways")
+      ),
+      reactome_pathway_id = dplyr::if_else(
+        reactome_pathway == "Other/unique Reactome pathways",
+        NA_character_,
+        reactome_pathway_id
+      )
+    )
+}
+
+finalize_reactome_pathway_assignments <- function(protein_df,
+                                                  pathway_assignments,
+                                                  kept_pathways) {
+  current_kept_pathways <- kept_pathways
+
+  repeat {
+    pathway_assignments_final <- assign_reactome_pathways_to_proteins(
+      protein_df,
+      pathway_assignments,
+      current_kept_pathways
+    )
+
+    final_pathway_counts <- pathway_assignments_final %>%
+      dplyr::filter(!is.na(reactome_pathway_id)) %>%
+      dplyr::distinct(protein, reactome_pathway_id, reactome_pathway) %>%
+      dplyr::count(reactome_pathway_id, reactome_pathway, name = "n_selected_proteins")
+
+    next_kept_pathways <- current_kept_pathways %>%
+      dplyr::select(pathway_id, pathway_name) %>%
+      dplyr::inner_join(
+        final_pathway_counts,
+        by = c("pathway_id" = "reactome_pathway_id", "pathway_name" = "reactome_pathway")
+      ) %>%
+      dplyr::filter(n_selected_proteins > 1) %>%
+      dplyr::arrange(dplyr::desc(n_selected_proteins), pathway_name)
+
+    if (nrow(next_kept_pathways) == nrow(current_kept_pathways)) {
+      return(list(
+        pathways = pathway_assignments_final,
+        pathways_to_keep = next_kept_pathways
+      ))
+    }
+
+    if (nrow(next_kept_pathways) == 0) {
+      return(list(
+        pathways = assign_reactome_pathways_to_proteins(
+          protein_df,
+          pathway_assignments,
+          next_kept_pathways
+        ),
+        pathways_to_keep = next_kept_pathways
+      ))
+    }
+
+    current_kept_pathways <- next_kept_pathways
+  }
+}
+
+build_module_network <- function(module_name,
+                                 n_proteins,
+                                 min_TOM = circular_min_TOM) {
+  node_df <- calculate_module_membership(module_name) %>%
+    dplyr::slice_max(kME_abs, n = circular_max_nodes, with_ties = FALSE) %>%
+    dplyr::arrange(dplyr::desc(kME_abs))
+
+  if (nrow(node_df) < 2) {
+    stop("At least two proteins are required to build a module network.")
+  }
+
+  top_proteins <- node_df$protein
+  top_expr <- SOLAR_WGCNA_model$reference$wgcna$datExpr[, top_proteins, drop = FALSE]
+
+  tom_matrix <- WGCNA::TOMsimilarityFromExpr(
+    top_expr,
+    power = SOLAR_WGCNA_model$reference$wgcna$soft_power,
+    networkType = SOLAR_WGCNA_model$parameters$network_type,
+    TOMType = SOLAR_WGCNA_model$parameters$tom_type,
+    verbose = 0
+  )
+  dimnames(tom_matrix) <- list(top_proteins, top_proteins)
+
+  edge_df <- as.data.frame(as.table(tom_matrix), stringsAsFactors = FALSE) %>%
+    tibble::as_tibble() %>%
+    dplyr::rename(from = Var1, to = Var2, TOM = Freq) %>%
+    dplyr::filter(from < to)
+
+  TOM_threshold <- max(
+    min_TOM,
+    stats::quantile(
+      edge_df$TOM,
+      probs = circular_TOM_threshold_quantile,
+      na.rm = TRUE
+    )
+  )
+
+  edge_df <- edge_df %>%
+    dplyr::filter(TOM >= TOM_threshold)
+
+  connected_proteins <- unique(c(edge_df$from, edge_df$to))
+
+  node_df <- node_df %>%
+    dplyr::filter(protein %in% connected_proteins) %>%
+    dplyr::mutate(
+      kME_group = dplyr::ntile(kME_abs, 3),
+      kME_group = factor(
+        kME_group,
+        levels = c(1, 2, 3),
+        labels = c("Relatively\nperipheral", "Moderately\ncentral", "Highly\ncentral")
+      )
+    )
+
+  edge_df <- edge_df %>%
+    dplyr::filter(from %in% node_df$protein, to %in% node_df$protein)
+
+  module_graph <- igraph::graph_from_data_frame(
+    d = edge_df,
+    vertices = node_df %>% dplyr::rename(name = protein),
+    directed = FALSE
+  )
+
+  igraph::set_graph_attr(module_graph, "TOM_threshold", TOM_threshold)
+}
+
+selected_significant_modules %>%
+  kableExtra::kbl(caption = "SOLAR reference modules selected for circular network plots: BH-adjusted p < 0.20 or nominal p < 0.05.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+```{r solar-reference-module-circular-network-plots, fig.width=9, fig.height=10}
+SOLAR_module_circular_network_graphs <- purrr::pmap(
+  selected_significant_modules,
+  function(module_label, module, n_proteins) {
+    build_module_network(module, n_proteins = n_proteins)
+  }
+)
+
+circular_network_selected_proteins <- purrr::map_dfr(
+  SOLAR_module_circular_network_graphs,
+  ~ igraph::as_data_frame(.x, what = "vertices")
+) %>%
+  dplyr::distinct(protein = name, protein_label)
+
+circular_network_reactome_all_pathways <- get_reactome_pathways_for_proteins(
+  circular_network_selected_proteins
+) %>%
+  dplyr::arrange(protein_label, pathway_name)
+
+circular_network_reactome_pathways_initial_keep <- select_reactome_pathways_to_keep(
+  circular_network_reactome_all_pathways
+)
+
+circular_network_reactome_assignment <- finalize_reactome_pathway_assignments(
+  circular_network_selected_proteins,
+  circular_network_reactome_all_pathways,
+  circular_network_reactome_pathways_initial_keep
+)
+
+circular_network_reactome_pathways_to_keep <- circular_network_reactome_assignment$pathways_to_keep
+
+circular_network_reactome_pathways <- circular_network_reactome_assignment$pathways %>%
+  dplyr::distinct(protein, protein_label, reactome_pathway_id, reactome_pathway) %>%
+  dplyr::mutate(
+    reactome_pathway_id = dplyr::if_else(
+      protein_label %in% c("APEX1", "POLR2F"),
+      "manual_dna_repair",
+      reactome_pathway_id
+    ),
+    reactome_pathway = dplyr::if_else(
+      protein_label %in% c("APEX1", "POLR2F"),
+      "DNA Repair",
+      reactome_pathway
+    )
+  )
+
+circular_network_reactome_pathways_to_keep <- circular_network_reactome_pathways %>%
+  dplyr::filter(!is.na(reactome_pathway_id)) %>%
+  dplyr::distinct(protein, reactome_pathway_id, reactome_pathway) %>%
+  dplyr::count(
+    pathway_id = reactome_pathway_id,
+    pathway_name = reactome_pathway,
+    name = "n_selected_proteins"
+  ) %>%
+  dplyr::filter(n_selected_proteins > 1) %>%
+  dplyr::arrange(dplyr::desc(n_selected_proteins), pathway_name)
+
+circular_network_reactome_pathways <- circular_network_reactome_pathways %>%
+  dplyr::mutate(
+    reactome_pathway = dplyr::if_else(
+      reactome_pathway %in% circular_network_reactome_pathways_to_keep$pathway_name,
+      reactome_pathway,
+      "Other/unique Reactome pathways"
+    ),
+    reactome_pathway_id = dplyr::if_else(
+      reactome_pathway == "Other/unique Reactome pathways",
+      NA_character_,
+      reactome_pathway_id
+    ),
+    reactome_pathway = factor(reactome_pathway, levels = sort(unique(reactome_pathway)))
+  )
+
+circular_network_pathway_levels <- levels(circular_network_reactome_pathways$reactome_pathway)
+circular_network_distinct_pathway_palette <- c(
+  "#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00",
+  "#56B4E9", "#882255", "#117733", "#332288", "#AA4499",
+  "#44AA99", "#999933", "#CC6677", "#6699CC", "#661100"
+)
+circular_network_pathway_colors <- setNames(
+  rep(
+    circular_network_distinct_pathway_palette,
+    length.out = length(circular_network_pathway_levels)
+  ),
+  circular_network_pathway_levels
+)
+circular_network_pathway_colors["Other/unique Reactome pathways"] <- "grey80"
+
+add_reactome_pathways_to_graph <- function(module_graph) {
+  node_df <- igraph::as_data_frame(module_graph, what = "vertices") %>%
+    dplyr::rename(protein = name) %>%
+    dplyr::left_join(
+      circular_network_reactome_pathways %>%
+        dplyr::select(protein, reactome_pathway_id, reactome_pathway),
+      by = "protein"
+    ) %>%
+    dplyr::mutate(reactome_pathway = dplyr::coalesce(
+      as.character(reactome_pathway),
+      "Other/unique Reactome pathways"
+    ))
+
+  edge_df <- igraph::as_data_frame(module_graph, what = "edges")
+
+  graph_with_reactome <- igraph::graph_from_data_frame(
+    d = edge_df,
+    vertices = node_df %>% dplyr::rename(name = protein),
+    directed = FALSE
+  )
+
+  igraph::set_graph_attr(
+    graph_with_reactome,
+    "TOM_threshold",
+    igraph::graph_attr(module_graph, "TOM_threshold")
+  )
+}
+
+plot_module_circular_network <- function(module_name,
+                                         module_label,
+                                         n_proteins,
+                                         module_graph = NULL,
+                                         show_pathway_legend = TRUE) {
+  if (is.null(module_graph)) {
+    module_graph <- build_module_network(module_name, n_proteins = n_proteins)
+  }
+
+  module_graph <- add_reactome_pathways_to_graph(module_graph)
+  circular_layout <- ggraph::create_layout(module_graph, layout = "linear", circular = TRUE) %>%
+    dplyr::mutate(
+      label_x = x * 1.12,
+      label_y = y * 1.12,
+      label_hjust = dplyr::case_when(
+        x > 0.15 ~ 0,
+        x < -0.15 ~ 1,
+        TRUE ~ 0.5
+      )
+    )
+
+  ggraph::ggraph(circular_layout) +
+    ggraph::geom_edge_arc(
+      ggplot2::aes(
+        alpha = TOM,
+        color = TOM,
+        edge_width = TOM
+      ),
+      width = 0.4,
+      show.legend = TRUE
+    ) +
+    ggraph::geom_node_point(
+      ggplot2::aes(size = kME_group, color = reactome_pathway),
+      alpha = 0.9,
+      show.legend = c(size = TRUE, colour = show_pathway_legend)
+    ) +
+    ggplot2::geom_label(
+      data = circular_layout,
+      ggplot2::aes(
+        x = label_x,
+        y = label_y,
+        label = protein_label,
+        hjust = label_hjust
+      ),
+      size = 3,
+      color = "black",
+      angle = 0,
+      vjust = 0.5,
+      fill = ggplot2::alpha("white", 0.65),
+      linewidth = 0,
+      label.padding = grid::unit(0.06, "lines")
+    ) +
+    ggraph::scale_edge_alpha(
+      range = c(0.20, 0.85),
+      guide = "none"
+    ) +
+    ggraph::scale_edge_width(
+      range = c(0.15, 0.7),
+      guide = "none"
+    ) +
+    ggraph::scale_edge_color_gradient(
+      low = "grey70",
+      high = "#54278F",
+      name = "Network similarity",
+      guide = ggraph::guide_edge_colourbar(
+        direction = "vertical",
+        title.position = "top",
+        order = 2,
+        barwidth = grid::unit(0.12, "in"),
+        barheight = grid::unit(0.8, "in")
+      )
+    ) +
+    ggplot2::scale_size_manual(
+      values = c(
+        "Relatively\nperipheral" = 2,
+        "Moderately\ncentral" = 3.5,
+        "Highly\ncentral" = 6
+      ),
+      name = "Module membership",
+      drop = FALSE,
+      guide = ggplot2::guide_legend(order = 1)
+    ) +
+    ggplot2::scale_color_manual(
+      values = circular_network_pathway_colors,
+      name = "Reactome pathway",
+      na.value = "grey60",
+      drop = FALSE
+    ) +
+    ggplot2::coord_equal(clip = "off") +
+    # title = paste0(module_label, " top ", circular_max_nodes, " hub proteins")
+    # subtitle = paste0(
+    #   "TOM >= ", round(igraph::graph_attr(module_graph, "TOM_threshold"), 3),
+    #   "; isolated hubs after TOM filtering removed"
+    # )
+    ggplot2::theme_void(base_size = 10) +
+    ggplot2::theme(
+      text = ggplot2::element_text(color = "black", size = 10),
+      legend.title = ggplot2::element_text(color = "black", size = 8),
+      legend.text = ggplot2::element_text(color = "black", size = 7),
+      legend.position = "right",
+      legend.direction = "vertical",
+      plot.margin = ggplot2::margin(t = 1, r = 4, b = 1, l = 6)
+    )
+}
+
+SOLAR_module_circular_network_plots <- purrr::pmap(
+  dplyr::bind_cols(
+    selected_significant_modules,
+    tibble::tibble(module_graph = SOLAR_module_circular_network_graphs)
+  ),
+  function(module_label, module, n_proteins, module_graph) {
+    plot_module_circular_network(
+      module,
+      module_label,
+      n_proteins,
+      module_graph = module_graph,
+      show_pathway_legend = FALSE
+    )
+  }
+)
+
+SOLAR_module_circular_network_legend_plots <- purrr::map(
+  SOLAR_module_circular_network_plots,
+  ~ .x + ggplot2::guides(color = "none")
+)
+
+SOLAR_module_circular_network_legends <- purrr::map(
+  SOLAR_module_circular_network_legend_plots,
+  cowplot::get_legend
+)
+
+SOLAR_module_circular_network_panel_plots <- purrr::map(
+  SOLAR_module_circular_network_plots,
+  ~ .x + ggplot2::theme(legend.position = "none")
+)
+
+SOLAR_module_circular_network_panel_with_legends <- purrr::map2(
+  SOLAR_module_circular_network_panel_plots,
+  SOLAR_module_circular_network_legends,
+  ~ cowplot::plot_grid(
+    .x,
+    NULL,
+    .y,
+    NULL,
+    ncol = 4,
+    rel_widths = c(1, 0.01, 0.32, 0.03)
+  )
+)
+
+SOLAR_module_circular_network_pathway_legend <- cowplot::get_legend(
+  tibble::tibble(
+    reactome_pathway = factor(
+      circular_network_pathway_levels,
+      levels = circular_network_pathway_levels
+    ),
+    x = seq_along(circular_network_pathway_levels),
+    y = 1
+  ) %>%
+    ggplot2::ggplot(ggplot2::aes(x = x, y = y, color = reactome_pathway)) +
+    ggplot2::geom_point(size = 3) +
+    ggplot2::scale_color_manual(
+      values = circular_network_pathway_colors,
+      name = "Reactome pathway",
+      na.value = "grey60",
+      drop = FALSE
+    ) +
+    ggplot2::guides(
+      color = ggplot2::guide_legend(
+        nrow = 4,
+        byrow = TRUE,
+        title.position = "top",
+        override.aes = list(size = 3)
+      )
+    ) +
+    ggplot2::theme_void(base_size = 10) +
+    ggplot2::theme(
+      legend.position = "bottom",
+      legend.title = ggplot2::element_text(color = "black", size = 10, hjust = 0.5),
+      legend.text = ggplot2::element_text(color = "black", size = 9),
+      legend.title.position = "top",
+      legend.spacing.y = grid::unit(0, "pt"),
+      legend.key.height = grid::unit(8, "pt"),
+      legend.key.width = grid::unit(10, "pt"),
+      legend.margin = ggplot2::margin(t = 0, r = 0, b = 0, l = 0),
+      legend.box.margin = ggplot2::margin(t = 0, r = 0, b = 0, l = 0)
+    )
+)
+
+SOLAR_module_circular_network_figure <- cowplot::plot_grid(
+  cowplot::plot_grid(
+    plotlist = SOLAR_module_circular_network_panel_with_legends,
+    ncol = 2,
+    align = "hv",
+    axis = "tblr"
+  ),
+  SOLAR_module_circular_network_pathway_legend,
+  ncol = 1,
+  rel_heights = c(1, 0.18)
+)
+
+SOLAR_module_circular_network_figure
+```
+
+```{r}
+#| eval: false
+
+ggsave(
+  SOLAR_module_circular_network_figure,
+  filename = fs::path(
+    dir_figures,
+    "Sig_modules_circular_plots.png"
+  ),
+  width = 9, height = 6, units = "in", dpi = 600
+)
+```

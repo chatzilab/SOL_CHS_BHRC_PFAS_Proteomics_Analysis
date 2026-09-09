@@ -1,0 +1,933 @@
+---
+title: "PFAS Proteomics Final Validation"
+author: "Zhenjiang Li"
+date: today
+toc: true
+toc_expand: 2
+format:
+  html:
+    code-fold: true
+    html-math-method: katex
+    fontsize: 16pt
+    grid:
+      sidebar-width: 0px
+      body-width: 1500px
+      margin-width: 500px
+      gutter-width: 1.5rem
+embed-resources: true
+editor: visual
+editor_options:
+  chunk_output_type: console
+---
+
+## Environment Setup {.hidden}
+
+```{=html}
+<style type="text/css">
+caption, .table-caption {
+  text-align: left;
+}
+</style>
+```
+
+```{r setup}
+#| echo: false
+
+options(scipen = 999)
+
+library(fs)
+library(here)
+i_am("1_scripts/!analytic_workflow_pfas_final_validation.qmd")
+
+source(here::here("1_scripts", "!libraries.R"))
+source(here::here("1_scripts", "!directories.R"))
+source(here::here("1_scripts", "!functions.R"))
+
+options(knitr.table.format = "html")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r shorten-long-path}
+#| include: false
+
+create_shortcut <- function(path, short_cut, drive) {
+  return(
+    sub(gsub("\\)", "\\\\)", gsub("\\(", "\\\\(", short_cut)), paste0(drive, ":"), path)
+  )
+}
+
+if (nchar(dir_data) > 80) {
+  system("subst x: /D")
+  short_cut <- dir_home |> dirname()
+  system(paste0("subst x: \"", short_cut, "\""))
+
+  dir_objects_names <- ls(pattern = "^dir_")
+  dir_list <- mget(dir_objects_names)
+
+  dir_list_shortened <- lapply(
+    dir_list,
+    function(y) create_shortcut(y, short_cut, "x")
+  )
+  list2env(dir_list_shortened, envir = .GlobalEnv)
+}
+
+rm(list = intersect(
+  c("dir_objects_names", "short_cut", "dir_list", "dir_list_shortened"),
+  ls()
+))
+```
+
+# Parameters
+
+```{r parameters}
+PFAS_abbrev_names <- c("PFOS", "PFOA", "PFNA", "PFDA", "PFHxS", "PFHpS")
+validation_cohort_levels <- c("SOLAR", "CHS", "SLP Age 25-35", "SLP Age 55-65", "BHRC")
+validation_non_slp_cohort_levels <- c("SOLAR", "CHS", "BHRC")
+validation_cohort_meta_levels <- c(validation_cohort_levels, "Meta-analysis")
+
+wgcna_adjusted_p_threshold <- 0.20
+wgcna_nominal_p_threshold <- 0.05
+
+praxis_bf_threshold <- 1
+
+dir_validation <- fs::path(dir_temp_data, "PFAS_final_validation")
+fs::dir_create(dir_validation)
+```
+
+# Helper Functions
+
+```{r workflow-source-helpers}
+eval_qmd_until <- function(qmd_path, stop_pattern, envir = parent.frame()) {
+  qmd_path <- here::here(qmd_path)
+  r_file <- tempfile(fileext = ".R")
+  knitr::purl(qmd_path, output = r_file, quiet = TRUE)
+
+  r_lines <- readLines(r_file, warn = FALSE)
+  stop_line <- grep(stop_pattern, r_lines)[1]
+
+  if (is.na(stop_line)) {
+    stop("Could not find stop pattern in tangled QMD: ", stop_pattern)
+  }
+
+  eval(parse(text = r_lines[seq_len(stop_line - 1)]), envir = envir)
+}
+
+collapse_unique <- function(x) {
+  x <- unique(stats::na.omit(as.character(x)))
+  paste(x, collapse = "; ")
+}
+
+make_effect_label <- function(beta, p_value) {
+  dplyr::case_when(
+    is.na(beta) ~ "",
+    !is.na(p_value) & p_value < 0.01 ~ "**",
+    !is.na(p_value) & p_value < 0.05 ~ "*",
+    TRUE ~ ""
+  )
+}
+
+inverse_variance_meta <- function(beta, se) {
+  keep <- !is.na(beta) & !is.na(se) & se > 0
+
+  if (sum(keep) == 0) {
+    return(tibble::tibble(
+      meta_n = 0L,
+      estimate_beta = NA_real_,
+      se_beta = NA_real_,
+      ci_beta_low = NA_real_,
+      ci_beta_high = NA_real_,
+      p_value = NA_real_
+    ))
+  }
+
+  weights <- 1 / se[keep]^2
+  estimate <- sum(weights * beta[keep]) / sum(weights)
+  se_meta <- sqrt(1 / sum(weights))
+  z_value <- estimate / se_meta
+
+  tibble::tibble(
+    meta_n = sum(keep),
+    estimate_beta = estimate,
+    se_beta = se_meta,
+    ci_beta_low = estimate - stats::qnorm(0.975) * se_meta,
+    ci_beta_high = estimate + stats::qnorm(0.975) * se_meta,
+    p_value = 2 * stats::pnorm(abs(z_value), lower.tail = FALSE)
+  )
+}
+
+```
+
+# WGCNA Review
+
+This section reviews SOLAR reference WGCNA modules associated with PFAS in SOLAR, CHS, or BHRC projected-module analyses.
+Modules are retained if any single PFAS or PFAS-mixture model has BH-adjusted p \< 0.20 or nominal p \< 0.05.
+Hub proteins are selected using the same network inclusion rule used for the WGCNA circular network plots: top proteins by absolute module membership are filtered to proteins connected by TOM edges above the plot threshold.
+The final hub list then keeps proteins labeled `Highly central` in the WGCNA circular network plot, which corresponds to the highest tertile of absolute module membership among network-included proteins.
+
+```{r load-wgcna-review-objects}
+eval_qmd_until(
+  qmd_path = "1_scripts/!analytic_workflow_pfas_WGCNA.qmd",
+  stop_pattern = "^SOLAR_module_circular_network_graphs <-"
+)
+
+wgcna_module_associations <- SOLAR_module_summary %>%
+  dplyr::filter(
+    !is.na(module_label),
+    module != "grey",
+    p.adjust.BH < wgcna_adjusted_p_threshold | p.value < wgcna_nominal_p_threshold
+  ) %>%
+  dplyr::arrange(p.adjust.BH, p.value)
+
+selected_wgcna_modules <- wgcna_module_associations %>%
+  dplyr::distinct(module_label, module, n_proteins) %>%
+  dplyr::arrange(module_label)
+
+selected_wgcna_modules %>%
+  kableExtra::kbl(
+    caption = paste0(
+      "PFAS-associated SOLAR reference modules: BH-adjusted p < ",
+      wgcna_adjusted_p_threshold,
+      " or nominal p < ",
+      wgcna_nominal_p_threshold,
+      "."
+    )
+  ) %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+```{r wgcna-hub-protein-selection}
+summarise_module_graph_nodes <- function(module_label, module, n_proteins) {
+  graph <- build_module_network(module, n_proteins = n_proteins)
+
+  vertex_df <- igraph::as_data_frame(graph, what = "vertices") %>%
+    tibble::as_tibble() %>%
+    dplyr::rename(protein = name)
+
+  edge_df <- igraph::as_data_frame(graph, what = "edges") %>%
+    tibble::as_tibble()
+
+  centrality_df <- dplyr::bind_rows(
+    edge_df %>% dplyr::transmute(protein = from, TOM = TOM),
+    edge_df %>% dplyr::transmute(protein = to, TOM = TOM)
+  ) %>%
+    dplyr::group_by(protein) %>%
+    dplyr::summarise(
+      TOM_degree = dplyr::n(),
+      TOM_strength = sum(TOM, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  vertex_df %>%
+    dplyr::left_join(centrality_df, by = "protein") %>%
+    dplyr::mutate(
+      module_label = module_label,
+      module = module,
+      TOM_degree = dplyr::coalesce(TOM_degree, 0L),
+      TOM_strength = dplyr::coalesce(TOM_strength, 0),
+      kME_group_clean = stringr::str_replace_all(as.character(kME_group), "\\n", " ")
+    ) %>%
+    dplyr::relocate(module_label, module, protein, protein_label)
+}
+
+wgcna_network_nodes <- purrr::pmap_dfr(
+  selected_wgcna_modules,
+  summarise_module_graph_nodes
+)
+
+wgcna_hub_proteins <- wgcna_network_nodes %>%
+  dplyr::filter(kME_group_clean == "Highly central") %>%
+  dplyr::group_by(module_label, module) %>%
+  dplyr::arrange(dplyr::desc(kME_abs), dplyr::desc(TOM_strength), dplyr::desc(TOM_degree), .by_group = TRUE) %>%
+  dplyr::ungroup() %>%
+  dplyr::left_join(
+    wgcna_module_associations %>%
+      dplyr::group_by(module_label, module) %>%
+      dplyr::summarise(
+        wgcna_associated_exposures = collapse_unique(exposure),
+        wgcna_min_p = min(p.value, na.rm = TRUE),
+        wgcna_min_BH = min(p.adjust.BH, na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = c("module_label", "module")
+  ) %>%
+  dplyr::transmute(
+    selection_source = "WGCNA hub",
+    OlinkID = protein,
+    Protein = protein_label,
+    module_label,
+    module,
+    kME,
+    kME_abs,
+    TOM_degree,
+    TOM_strength,
+    wgcna_associated_exposures,
+    wgcna_min_p,
+    wgcna_min_BH
+  )
+
+wgcna_hub_proteins %>%
+  dplyr::arrange(module_label, dplyr::desc(kME_abs)) %>%
+  kableExtra::kbl(caption = "Highly central WGCNA hub proteins from PFAS-associated modules.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+# Praxis-BGM Review
+
+This section retrieves proteins with Praxis-BGM feature importance at or above 1 from the saved SOLAR reference and CHS/BHRC transfer models.
+When a live Praxis-BGM Python model is available, the workflow uses the wrapper Bayes-factor selection helper.
+If a model has been reloaded from RDS and the Python `BF_selection()` method is no longer callable, the workflow uses a saved-model fallback: standardized posterior cluster separation for each protein, calculated from the fitted posterior means and variances.
+The fallback keeps the validation reproducible from saved model files and labels the metric explicitly as `posterior_cluster_separation`.
+
+```{r load-praxis-review-objects}
+eval_qmd_until(
+  qmd_path = "1_scripts/!analytic_workflow_pfas_praxis_BGM.qmd",
+  stop_pattern = "^set.seed\\(praxis_seed\\)"
+)
+
+if (!exists("praxis_bgm_bf_selection")) {
+  praxis_r_interface_path <- Sys.getenv("PRAXIS_BGM_R_INTERFACE", unset = "")
+
+  if (nzchar(praxis_r_interface_path) && fs::file_exists(praxis_r_interface_path)) {
+    source(praxis_r_interface_path)
+  } else {
+    message(
+      "Praxis-BGM R wrapper was not found locally; using posterior cluster ",
+      "separation fallback for saved-model feature importance."
+    )
+  }
+}
+
+praxis_bf_file <- fs::path(dir_praxis, "Praxis_BGM_bayes_factor_top_features.csv")
+SOLAR_praxis_model <- readRDS(fs::path(dir_praxis, "SOLAR_praxis_BGM_reference_model.rds"))
+transfer_praxis_models <- readRDS(fs::path(dir_praxis, "CHS_BHRC_praxis_BGM_transfer_models.rds"))
+
+praxis_feature_names <- SOLAR_praxis_model$feature_names
+
+posterior_cluster_separation <- function(fit, cohort, feature_names) {
+  mus <- fit$posterior_mus
+  covs <- fit$posterior_covs
+
+  if (is.null(mus) || is.null(covs) || length(dim(mus)) != 2 || length(dim(covs)) != 3) {
+    stop("Saved Praxis-BGM fit does not contain posterior means and covariances.")
+  }
+
+  if (nrow(mus) != 2) {
+    stop("Posterior separation fallback currently expects a two-cluster Praxis-BGM fit.")
+  }
+
+  pooled_var <- (diag(covs[1, , , drop = TRUE]) + diag(covs[2, , , drop = TRUE])) / 2
+  pooled_sd <- sqrt(pmax(pooled_var, .Machine$double.eps))
+  separation <- abs(mus[1, ] - mus[2, ]) / pooled_sd
+
+  tibble::tibble(
+    cohort = cohort,
+    feature_index = seq_along(feature_names),
+    OlinkID = feature_names,
+    importance_value = as.numeric(separation),
+    importance_metric = "posterior_cluster_separation"
+  ) %>%
+    dplyr::arrange(dplyr::desc(importance_value)) %>%
+    dplyr::mutate(importance_rank = dplyr::row_number())
+}
+
+try_praxis_bf_selection <- function(model, data, cohort, feature_names) {
+  if (!exists("praxis_bgm_bf_selection")) {
+    return(posterior_cluster_separation(model, cohort, feature_names))
+  }
+
+  bf <- tryCatch(
+    praxis_bgm_bf_selection(
+      model = model,
+      data = data,
+      top_n = length(feature_names),
+      visual = FALSE
+    ),
+    error = function(e) {
+      message(
+        "Praxis-BGM BF_selection() unavailable for ",
+        cohort,
+        "; using posterior cluster separation fallback. Original error: ",
+        conditionMessage(e)
+      )
+      NULL
+    }
+  )
+
+  if (is.null(bf)) {
+    return(posterior_cluster_separation(model, cohort, feature_names))
+  }
+
+  out <- tibble::tibble(
+    cohort = cohort,
+    feature_index = bf$top_features,
+    OlinkID = feature_names[bf$top_features],
+    importance_value = NA_real_,
+    importance_metric = "Praxis-BGM BF"
+  )
+
+  candidate_value_names <- c("bayes_factors", "bf_values", "BF", "scores", "feature_scores")
+  value_name <- intersect(candidate_value_names, names(bf))[1]
+
+  if (!is.na(value_name)) {
+    values <- bf[[value_name]]
+    if (length(values) == length(praxis_feature_names)) {
+      out <- out %>%
+        dplyr::mutate(importance_value = as.numeric(values[feature_index]))
+    } else if (length(values) == length(bf$top_features)) {
+      out <- out %>%
+        dplyr::mutate(importance_value = as.numeric(values))
+    }
+  }
+
+  if (all(is.na(out$importance_value))) {
+    message(
+      "Praxis-BGM BF_selection() returned no recognized BF/value field for ",
+      cohort,
+      "; using posterior cluster separation fallback."
+    )
+    return(posterior_cluster_separation(model, cohort, feature_names))
+  }
+
+  out %>%
+    dplyr::arrange(dplyr::desc(importance_value)) %>%
+    dplyr::mutate(importance_rank = dplyr::row_number())
+}
+
+if (fs::file_exists(praxis_bf_file)) {
+  praxis_bf_top_features <- readr::read_csv(praxis_bf_file, show_col_types = FALSE) %>%
+    dplyr::transmute(
+      cohort,
+      feature_index,
+      OlinkID = feature_name,
+      importance_value,
+      importance_rank,
+      importance_metric = "Praxis-BGM BF",
+      Protein,
+      UniProt
+    )
+} else {
+  praxis_bf_top_features <- dplyr::bind_rows(
+    try_praxis_bf_selection(SOLAR_praxis_model$fit, SOLAR_scaled$X, "SOLAR", praxis_feature_names),
+    try_praxis_bf_selection(transfer_praxis_models$CHS$fit, CHS_scaled$X, "CHS", praxis_feature_names),
+    try_praxis_bf_selection(transfer_praxis_models$BHRC$fit, BHRC_scaled$X, "BHRC", praxis_feature_names)
+  ) %>%
+    dplyr::left_join(
+      proteomics_property %>%
+        dplyr::select(OlinkID, Protein, UniProt),
+      by = "OlinkID"
+    )
+}
+
+praxis_top_proteins <- praxis_bf_top_features %>%
+  dplyr::filter(!is.na(importance_value), importance_value >= praxis_bf_threshold) %>%
+  dplyr::group_by(OlinkID, Protein, UniProt) %>%
+  dplyr::summarise(
+    selection_source = "Praxis-BGM importance",
+    praxis_cohorts = collapse_unique(cohort),
+    praxis_importance_metric = collapse_unique(importance_metric),
+    praxis_max_importance = max(importance_value, na.rm = TRUE),
+    praxis_best_rank = min(importance_rank, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+praxis_top_proteins %>%
+  dplyr::arrange(dplyr::desc(praxis_max_importance), praxis_best_rank) %>%
+  kableExtra::kbl(caption = paste0("Praxis-BGM proteins with feature importance >= ", praxis_bf_threshold, ".")) %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+# Candidate Protein Pool
+
+```{r pooled-candidate-proteins}
+candidate_proteins <- dplyr::bind_rows(
+  wgcna_hub_proteins %>%
+    dplyr::select(selection_source, OlinkID, Protein, module_label, module, kME_abs, TOM_degree, TOM_strength, wgcna_associated_exposures, wgcna_min_p, wgcna_min_BH),
+  praxis_top_proteins %>%
+    dplyr::select(selection_source, OlinkID, Protein, praxis_cohorts, praxis_importance_metric, praxis_max_importance, praxis_best_rank)
+) %>%
+  dplyr::group_by(OlinkID) %>%
+  dplyr::summarise(
+    Protein = dplyr::coalesce(stats::na.omit(Protein)[1], OlinkID[1]),
+    selection_sources = collapse_unique(selection_source),
+    module_label = collapse_unique(module_label),
+    module = collapse_unique(module),
+    wgcna_associated_exposures = collapse_unique(wgcna_associated_exposures),
+    wgcna_min_p = suppressWarnings(min(wgcna_min_p, na.rm = TRUE)),
+    wgcna_min_BH = suppressWarnings(min(wgcna_min_BH, na.rm = TRUE)),
+    max_kME_abs = suppressWarnings(max(kME_abs, na.rm = TRUE)),
+    max_TOM_degree = suppressWarnings(max(TOM_degree, na.rm = TRUE)),
+    max_TOM_strength = suppressWarnings(max(TOM_strength, na.rm = TRUE)),
+    praxis_cohorts = collapse_unique(praxis_cohorts),
+    praxis_importance_metric = collapse_unique(praxis_importance_metric),
+    praxis_max_importance = suppressWarnings(max(praxis_max_importance, na.rm = TRUE)),
+    praxis_best_rank = suppressWarnings(min(praxis_best_rank, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    dplyr::across(
+      c(wgcna_min_p, wgcna_min_BH, max_kME_abs, max_TOM_degree, max_TOM_strength, praxis_max_importance, praxis_best_rank),
+      ~ dplyr::if_else(is.infinite(.x), NA_real_, .x)
+    ),
+    display_label = dplyr::if_else(is.na(Protein) | Protein == "", OlinkID, Protein)
+  ) %>%
+  dplyr::arrange(selection_sources, module_label, dplyr::desc(praxis_max_importance), display_label)
+
+readr::write_csv(
+  candidate_proteins,
+  fs::path(dir_validation, "PFAS_validation_candidate_proteins.csv")
+)
+
+candidate_proteins %>%
+  kableExtra::kbl(caption = "Pooled WGCNA and Praxis-BGM candidate proteins.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+# PWAS Effect Retrieval
+
+```{r pwas-effect-retrieval}
+pwas_single_file <- fs::path(dir_temp_data, "PFAS_PWAS", "PFAS_single_PWAS_results.csv")
+slp_pwas_single_file <- fs::path(dir_temp_data, "PFAS_PWAS_BRI", "BRI_SLP_single_PFAS_PWAS_results.csv")
+
+if (!fs::file_exists(pwas_single_file)) {
+  stop("Missing SOLAR/CHS/BHRC single-PFAS PWAS file: ", pwas_single_file)
+}
+
+if (!fs::file_exists(slp_pwas_single_file)) {
+  stop("Missing BRI SLP single-PFAS PWAS file: ", slp_pwas_single_file)
+}
+
+pwas_effects_main <- readr::read_csv(pwas_single_file, show_col_types = FALSE) %>%
+  dplyr::filter(OlinkID %in% candidate_proteins$OlinkID) %>%
+  dplyr::transmute(
+    cohort = cohort,
+    analysis_group = cohort,
+    OlinkID,
+    Protein,
+    UniProt,
+    pfas_abbrev,
+    estimate_beta,
+    se_beta,
+    ci_beta_low,
+    ci_beta_high,
+    p_value,
+    adjusted_pval_BH
+  )
+
+pwas_effects_slp <- readr::read_csv(slp_pwas_single_file, show_col_types = FALSE) %>%
+  dplyr::filter(
+    OlinkID %in% candidate_proteins$OlinkID,
+    analysis_group %in% c("Age 25-35", "Age 55-65")
+  ) %>%
+  dplyr::transmute(
+    cohort = "SLP",
+    analysis_group = paste("SLP", analysis_group),
+    OlinkID,
+    Protein,
+    UniProt,
+    pfas_abbrev,
+    estimate_beta,
+    se_beta,
+    ci_beta_low,
+    ci_beta_high,
+    p_value,
+    adjusted_pval_BH
+  )
+
+pwas_candidate_effects <- dplyr::bind_rows(
+  pwas_effects_main,
+  pwas_effects_slp
+) %>%
+  dplyr::left_join(
+    candidate_proteins %>%
+      dplyr::select(OlinkID, selection_sources, module_label, wgcna_associated_exposures, praxis_max_importance, display_label),
+    by = "OlinkID"
+  ) %>%
+  dplyr::mutate(
+    analysis_group = factor(analysis_group, levels = validation_cohort_levels),
+    pfas_abbrev = factor(pfas_abbrev, levels = PFAS_abbrev_names),
+    estimate_beta_log2 = estimate_beta,
+    effect_label = make_effect_label(estimate_beta_log2, p_value)
+  ) %>%
+  dplyr::arrange(display_label, analysis_group, pfas_abbrev)
+
+readr::write_csv(
+  pwas_candidate_effects,
+  fs::path(dir_validation, "PFAS_validation_candidate_PWAS_effects_long.csv")
+)
+
+pwas_candidate_effects_wide <- pwas_candidate_effects %>%
+  dplyr::select(
+    display_label,
+    OlinkID,
+    Protein,
+    selection_sources,
+    analysis_group,
+    pfas_abbrev,
+    estimate_beta_log2,
+    p_value,
+    adjusted_pval_BH
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = c(analysis_group, pfas_abbrev),
+    values_from = c(estimate_beta_log2, p_value, adjusted_pval_BH),
+    names_glue = "{analysis_group}_{pfas_abbrev}_{.value}"
+  )
+
+readr::write_csv(
+  pwas_candidate_effects_wide,
+  fs::path(dir_validation, "PFAS_validation_candidate_PWAS_effects_wide.csv")
+)
+
+pwas_candidate_effects_wide %>%
+  kableExtra::kbl(caption = "Candidate-protein PWAS effect estimates across cohorts and SLP age groups.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+# PFAS-Protein Meta-analysis
+
+For each prioritized protein and PFAS pair, cohort-specific PWAS estimates are combined using fixed-effect inverse-variance meta-analysis.
+The meta-estimate is on the same per-doubling PFAS scale as the cohort-specific PWAS estimates.
+
+```{r pwas-effect-meta-analysis}
+pwas_candidate_meta_effects <- pwas_candidate_effects %>%
+  dplyr::filter(!is.na(analysis_group)) %>%
+  dplyr::group_by(OlinkID, Protein, UniProt, pfas_abbrev) %>%
+  dplyr::group_modify(~ inverse_variance_meta(.x$estimate_beta_log2, .x$se_beta)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    adjusted_pval_BH = stats::p.adjust(p_value, method = "BH"),
+    cohort = "Meta-analysis",
+    analysis_group = factor("Meta-analysis", levels = validation_cohort_meta_levels),
+    pfas_abbrev = factor(pfas_abbrev, levels = PFAS_abbrev_names),
+    estimate_beta_log2 = estimate_beta,
+    effect_label = make_effect_label(estimate_beta_log2, p_value)
+  ) %>%
+  dplyr::left_join(
+    candidate_proteins %>%
+      dplyr::select(OlinkID, selection_sources, module_label, wgcna_associated_exposures, praxis_max_importance, display_label),
+    by = "OlinkID"
+  ) %>%
+  dplyr::select(
+    cohort,
+    analysis_group,
+    OlinkID,
+    Protein,
+    UniProt,
+    pfas_abbrev,
+    meta_n,
+    estimate_beta,
+    se_beta,
+    ci_beta_low,
+    ci_beta_high,
+    p_value,
+    adjusted_pval_BH,
+    selection_sources,
+    module_label,
+    wgcna_associated_exposures,
+    praxis_max_importance,
+    display_label,
+    estimate_beta_log2,
+    effect_label
+  ) %>%
+  dplyr::arrange(display_label, pfas_abbrev)
+
+pwas_candidate_meta_effects %>%
+  dplyr::select(
+    display_label,
+    OlinkID,
+    Protein,
+    pfas_abbrev,
+    meta_n,
+    estimate_beta_log2,
+    se_beta,
+    ci_beta_low,
+    ci_beta_high,
+    p_value,
+    adjusted_pval_BH
+  ) %>%
+  kableExtra::kbl(caption = "Fixed-effect inverse-variance meta-analysis of prioritized PFAS-protein associations.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+# Effect Estimate Heatmap
+
+The heatmap focuses on candidate proteins with PWAS estimates available in all validation analysis groups: SOLAR, CHS, BHRC, SLP Age 25-35, and SLP Age 55-65.
+Because the PWAS models were fit using log2-transformed PFAS exposures, the fitted beta is the NPX change per one-unit increase in log2 PFAS, equivalent to a doubling in PFAS concentration.
+The heatmap therefore displays the original PWAS effect estimates on the per-doubling PFAS scale.
+
+```{r pwas-effect-heatmap, fig.width=12, fig.height=8}
+overlap_candidate_proteins <- pwas_candidate_effects %>%
+  dplyr::distinct(OlinkID, analysis_group) %>%
+  dplyr::count(OlinkID, name = "n_analysis_groups") %>%
+  dplyr::filter(n_analysis_groups == length(validation_cohort_levels)) %>%
+  dplyr::inner_join(candidate_proteins, by = "OlinkID")
+
+if (nrow(overlap_candidate_proteins) == 0) {
+  stop("No candidate proteins have PWAS estimates in all validation analysis groups.")
+}
+
+protein_order <- pwas_candidate_effects %>%
+  dplyr::filter(OlinkID %in% overlap_candidate_proteins$OlinkID) %>%
+  dplyr::distinct(display_label, selection_sources, module_label, praxis_max_importance) %>%
+  dplyr::arrange(selection_sources, module_label, dplyr::desc(praxis_max_importance), display_label) %>%
+  dplyr::pull(display_label)
+
+pwas_effect_heatmap_df <- pwas_candidate_effects %>%
+  dplyr::filter(OlinkID %in% overlap_candidate_proteins$OlinkID) %>%
+  dplyr::mutate(
+    display_label = factor(display_label, levels = rev(unique(protein_order))),
+    analysis_group = factor(analysis_group, levels = validation_cohort_levels),
+    pfas_abbrev = factor(pfas_abbrev, levels = PFAS_abbrev_names),
+    sig_label = dplyr::case_when(
+      !is.na(p_value) & p_value < 0.01 ~ "**",
+      !is.na(p_value) & p_value < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+pwas_effect_heatmap <- ggplot2::ggplot(
+  pwas_effect_heatmap_df,
+  ggplot2::aes(x = analysis_group, y = display_label, fill = estimate_beta_log2)
+) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.25) +
+  ggplot2::geom_text(ggplot2::aes(label = sig_label), size = 2.6) +
+  ggplot2::facet_grid(. ~ pfas_abbrev, drop = FALSE) +
+  ggplot2::scale_fill_gradient2(
+    low = "#2C7BB6",
+    mid = "grey98",
+    high = "#D7191C",
+    midpoint = 0,
+    na.value = "grey90",
+    name = "NPX change per PFAS doubling"
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = NULL,
+    # caption = paste(
+    #   "Only candidate proteins with PWAS estimates in SOLAR, CHS, BHRC, and both SLP age groups are shown.",
+    #   "Effect estimates are original PWAS betas: NPX change per doubling in PFAS concentration.",
+    #   "* nominal p < 0.05; ** nominal p < 0.01"
+    # )
+  ) +
+  ggplot2::theme_bw(base_size = 10) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, vjust = 1),
+    panel.grid = ggplot2::element_blank(),
+    strip.background = ggplot2::element_rect(fill = "grey90", color = NA),
+    legend.position = "bottom",
+    plot.caption = ggplot2::element_text(hjust = 0)
+  )
+
+pwas_effect_heatmap
+
+ggplot2::ggsave(
+  filename = fs::path(dir_figures, "PFAS_final_validation_candidate_PWAS_heatmap.png"),
+  plot = pwas_effect_heatmap,
+  dpi = 600,
+  units = "in",
+  width = 6.5,
+  height = 4.5
+)
+```
+
+## Effect Estimate Heatmap With Meta-analysis
+
+This heatmap uses the same prioritized proteins and cohort-specific PWAS estimates as the all-cohorts heatmap, with an added fixed-effect meta-analysis column for each PFAS.
+
+```{r pwas-effect-heatmap-with-meta-analysis, fig.width=13, fig.height=8}
+pwas_effect_heatmap_with_meta_df <- dplyr::bind_rows(
+  pwas_effect_heatmap_df %>%
+    dplyr::mutate(
+      analysis_group = as.character(analysis_group),
+      pfas_abbrev = as.character(pfas_abbrev)
+    ),
+  pwas_candidate_meta_effects %>%
+    dplyr::filter(OlinkID %in% overlap_candidate_proteins$OlinkID) %>%
+    dplyr::mutate(
+      sig_label = dplyr::case_when(
+        !is.na(p_value) & p_value < 0.01 ~ "**",
+        !is.na(p_value) & p_value < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      analysis_group = as.character(analysis_group),
+      pfas_abbrev = as.character(pfas_abbrev)
+    )
+) %>%
+  dplyr::mutate(
+    display_label = factor(as.character(display_label), levels = rev(unique(protein_order))),
+    analysis_group = factor(analysis_group, levels = validation_cohort_meta_levels),
+    pfas_abbrev = factor(pfas_abbrev, levels = PFAS_abbrev_names)
+  )
+
+pwas_effect_heatmap_with_meta <- ggplot2::ggplot(
+  pwas_effect_heatmap_with_meta_df,
+  ggplot2::aes(x = analysis_group, y = display_label, fill = estimate_beta_log2)
+) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.25) +
+  ggplot2::geom_text(ggplot2::aes(label = sig_label), size = 2.6) +
+  ggplot2::facet_grid(. ~ pfas_abbrev, drop = FALSE) +
+  ggplot2::scale_fill_gradient2(
+    low = "#2C7BB6",
+    mid = "grey98",
+    high = "#D7191C",
+    midpoint = 0,
+    na.value = "grey90",
+    name = "NPX change per PFAS doubling"
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = NULL
+  ) +
+  ggplot2::theme_bw(base_size = 10) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, vjust = 1),
+    panel.grid = ggplot2::element_blank(),
+    strip.background = ggplot2::element_rect(fill = "grey90", color = NA),
+    legend.position = "bottom",
+    plot.caption = ggplot2::element_text(hjust = 0)
+  )
+
+pwas_effect_heatmap_with_meta
+
+ggplot2::ggsave(
+  filename = fs::path(dir_figures, "PFAS_final_validation_candidate_PWAS_heatmap_with_meta_analysis.png"),
+  plot = pwas_effect_heatmap_with_meta,
+  dpi = 600,
+  units = "in",
+  width = 7.5,
+  height = 4.5
+)
+```
+
+## Effect Estimate Heatmap Table
+
+This table includes the PWAS effect estimates and nominal p-values displayed in the all-cohorts heatmap.
+
+```{r pwas-effect-heatmap-table}
+pwas_effect_heatmap_estimates_nominal_p <- pwas_effect_heatmap_df %>%
+  dplyr::mutate(
+    display_label = as.character(display_label),
+    analysis_group = as.character(analysis_group),
+    pfas_abbrev = as.character(pfas_abbrev),
+    estimate_beta_log2 = dplyr::case_when(
+      is.na(estimate_beta_log2) ~ NA_character_,
+      !is.na(p_value) & p_value < 0.01 ~ paste0(sprintf("%.2f", estimate_beta_log2), "**"),
+      !is.na(p_value) & p_value < 0.05 ~ paste0(sprintf("%.2f", estimate_beta_log2), "*"),
+      TRUE ~ sprintf("%.2f", estimate_beta_log2)
+    )
+  ) %>%
+  dplyr::select(
+    OlinkID,
+    Protein,
+    display_label,
+    selection_sources,
+    analysis_group,
+    pfas_abbrev,
+    estimate_beta_log2
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = c(analysis_group, pfas_abbrev),
+    values_from = estimate_beta_log2,
+    names_glue = "{analysis_group}_{pfas_abbrev}_{.value}"
+  )
+
+# readr::write_csv(
+#   pwas_effect_heatmap_estimates_nominal_p,
+#   fs::path(dir_validation, "PFAS_final_validation_candidate_PWAS_heatmap_all_cohorts_estimates_nominal_p.csv")
+# )
+
+pwas_effect_heatmap_estimates_nominal_p %>%
+  kableExtra::kbl(
+    caption = "Candidate-protein PWAS effect estimates across all validation cohorts"
+  ) %>%
+  kableExtra::kable_paper("hover", full_width = FALSE) %>%
+  kableExtra::footnote(
+    general = c(
+      "Values are PWAS beta estimates representing NPX change per doubling in PFAS concentration.",
+      "Asterisks indicate nominal association strength: * p < 0.05; ** p < 0.01.",
+      "The table includes the candidate proteins displayed in the all-cohorts heatmap."
+    ),
+    general_title = "Notes: ",
+    footnote_as_chunk = TRUE
+  )
+```
+
+## Effect Estimate Heatmap Without SLP Cohorts
+
+This heatmap focuses on candidate proteins with PWAS estimates available in the non-SLP validation cohorts: SOLAR, CHS, and BHRC.
+The heatmap displays the original PWAS effect estimates on the per-doubling PFAS scale.
+
+```{r pwas-effect-heatmap-no-slp, fig.width=12, fig.height=8}
+overlap_candidate_proteins_no_slp <- pwas_candidate_effects %>%
+  dplyr::filter(analysis_group %in% validation_non_slp_cohort_levels) %>%
+  dplyr::distinct(OlinkID, analysis_group) %>%
+  dplyr::count(OlinkID, name = "n_analysis_groups") %>%
+  dplyr::filter(n_analysis_groups == length(validation_non_slp_cohort_levels)) %>%
+  dplyr::inner_join(candidate_proteins, by = "OlinkID")
+
+if (nrow(overlap_candidate_proteins_no_slp) == 0) {
+  stop("No candidate proteins have PWAS estimates in all non-SLP validation cohorts.")
+}
+
+protein_order_no_slp <- pwas_candidate_effects %>%
+  dplyr::filter(OlinkID %in% overlap_candidate_proteins_no_slp$OlinkID) %>%
+  dplyr::distinct(display_label, selection_sources, module_label, praxis_max_importance) %>%
+  dplyr::arrange(selection_sources, module_label, dplyr::desc(praxis_max_importance), display_label) %>%
+  dplyr::pull(display_label)
+
+pwas_effect_heatmap_no_slp_df <- pwas_candidate_effects %>%
+  dplyr::filter(
+    OlinkID %in% overlap_candidate_proteins_no_slp$OlinkID,
+    analysis_group %in% validation_non_slp_cohort_levels
+  ) %>%
+  dplyr::mutate(
+    display_label = factor(display_label, levels = rev(unique(protein_order_no_slp))),
+    analysis_group = factor(analysis_group, levels = validation_non_slp_cohort_levels),
+    pfas_abbrev = factor(pfas_abbrev, levels = PFAS_abbrev_names),
+    sig_label = dplyr::case_when(
+      !is.na(p_value) & p_value < 0.01 ~ "**",
+      !is.na(p_value) & p_value < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+pwas_effect_heatmap_no_slp <- ggplot2::ggplot(
+  pwas_effect_heatmap_no_slp_df,
+  ggplot2::aes(x = display_label, y = analysis_group, fill = estimate_beta_log2)
+) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.25) +
+  ggplot2::geom_text(ggplot2::aes(label = sig_label), size = 2.6) +
+  ggplot2::facet_grid(pfas_abbrev ~ ., drop = FALSE) +
+  ggplot2::scale_fill_gradient2(
+    low = "#2C7BB6",
+    mid = "grey98",
+    high = "#D7191C",
+    midpoint = 0,
+    na.value = "grey90",
+    name = "NPX change per PFAS doubling"
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = NULL
+  ) +
+  ggplot2::theme_bw(base_size = 10) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, vjust = 1),
+    panel.grid = ggplot2::element_blank(),
+    strip.background = ggplot2::element_rect(fill = "grey90", color = NA),
+    strip.text.y = ggplot2::element_text(angle = 0),
+    legend.position = "bottom",
+    plot.caption = ggplot2::element_text(hjust = 0)
+  )
+
+pwas_effect_heatmap_no_slp
+
+ggplot2::ggsave(
+  filename = fs::path(dir_figures, "PFAS_final_validation_candidate_PWAS_heatmap_no_SLP.png"),
+  plot = pwas_effect_heatmap_no_slp,
+  dpi = 600,
+  units = "in",
+  width = 8,
+  height = 6
+)
+```

@@ -1,0 +1,847 @@
+---
+title: "SOLAR, CHS, and BHRC Proteomics WGCNA"
+author: "Zhenjiang Li"
+date: today
+toc: true
+toc_expand: 2
+format:
+  html:
+    code-fold: true
+    html-math-method: katex
+    fontsize: 16pt
+    grid:
+      sidebar-width: 0px
+      body-width: 1500px
+      margin-width: 500px
+      gutter-width: 1.5rem
+embed-resources: true
+editor: visual
+editor_options:
+  chunk_output_type: console
+---
+
+## Environment Setup {.hidden}
+
+```{=html}
+<style type="text/css">
+caption, .table-caption {
+  text-align: left;
+}
+</style>
+```
+
+```{r setup}
+#| echo: false
+
+options(scipen = 999)
+
+library(fs)
+library(here)
+i_am("1_scripts/!analytic_workflow_proteomcis_WGCNA.qmd")
+
+source(fs::path("1_scripts", "!libraries.R"))
+source(fs::path("1_scripts", "!directories.R"))
+source(fs::path("1_scripts", "!functions.R"))
+
+options(knitr.table.format = "html")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+```{r}
+#| label: shorten-long-path
+#| include: false
+
+create_shortcut <- function(path, short_cut, drive) {
+  return(
+    sub(gsub("\\)", "\\\\)", gsub("\\(", "\\\\(", short_cut)), paste0(drive, ":"), path)
+  )
+}
+
+if (nchar(dir_data) > 80) {
+  system("subst x: /D")
+  short_cut <- dir_home |> dirname()
+  system(paste0("subst x: \"", short_cut, "\""))
+
+  dir_objects_names <- ls(pattern = "^dir_")
+  dir_list <- mget(dir_objects_names)
+
+  dir_list_shortened <- lapply(
+    dir_list,
+    function(y) create_shortcut(y, short_cut, "x")
+  )
+  list2env(dir_list_shortened, envir = .GlobalEnv)
+}
+
+rm(list = intersect(
+  c("dir_objects_names", "short_cut", "dir_list", "dir_list_shortened"),
+  ls()
+))
+```
+
+# Parameters
+
+```{r}
+cohort_names <- c("SOLAR", "CHS", "BHRC")
+proteomics_metadata_cols <- c("LABID", "study", "Batch")
+
+max_protein_missing <- 0.20
+powers <- c(1:10, seq(12, 20, by = 2))
+fallback_power <- 6
+
+min_module_size <- 15
+merge_cut_height <- 0.15
+network_type <- "unsigned"
+tom_type <- "unsigned"
+module_preservation_permutations <- 200
+module_preservation_seed <- 20260722
+rerun_module_preservation <- FALSE
+
+dir_wgcna <- fs::path(dir_temp_data, "WGCNA")
+dir_manuscript <- fs::path(dir_project, "4_manuscripts")
+fs::dir_create(dir_wgcna)
+fs::dir_create(dir_manuscript)
+```
+
+Parameter choices:
+
+- `max_protein_missing = 0.20`: removes proteins with more than 20% missing values before imputation, so modules are not driven by sparse measurements.
+- `powers`: candidate soft-thresholding powers used by `pickSoftThreshold()` to choose an approximate scale-free topology.
+- `fallback_power = 6`: used only if `pickSoftThreshold()` does not return a power; 6 is a moderate default for WGCNA networks.
+- `min_module_size = 15`: allows smaller protein modules, which is reasonable for proteomics where the measured feature set is much smaller than transcriptomics.
+- `merge_cut_height = 0.15`: merges modules with highly similar eigengenes, corresponding to eigengene correlation above about 0.85.
+- `network_type = "unsigned"` and `tom_type = "unsigned"`: groups proteins using absolute correlation, so strongly positive and strongly negative connections can contribute to the same module.
+- `reassignThreshold = 0`: keeps the initial dynamic tree cut assignments stable rather than reassigning borderline proteins.
+- `pamRespectsDendro = FALSE`: allows PAM refinement after the tree cut, a common WGCNA setting for blockwise modules.
+- `module_preservation_permutations = 200`: uses permutation testing to evaluate whether SOLAR module co-expression structure is preserved in CHS and BHRC. Increase this value for final publication-grade inference if runtime is acceptable.
+- `rerun_module_preservation = FALSE`: loads the saved SOLAR preservation RDS when available, avoiding a repeat of the permutation step. Set to `TRUE` to recompute preservation results.
+
+# Data Preparation
+
+```{r proteomics-data}
+proteomics_l <- readRDS(fs::path(
+  dir_data,
+  "ShARP_BHRC_Shared",
+  "ShARP_BHRC_Data_Shared",
+  "OLINK_proteomics_bridged_BHRC_SOLAR_CHS.rds"
+))
+
+overlap_proteins <- proteomics_l[cohort_names] %>%
+  purrr::map(~ setdiff(names(.x), proteomics_metadata_cols)) %>%
+  purrr::reduce(intersect)
+
+proteomics_l <- proteomics_l[c(cohort_names, "protein_annotation")]
+
+proteomics_l[cohort_names] <- proteomics_l[cohort_names] %>%
+  purrr::map(
+    ~ .x %>%
+      dplyr::select(
+        tidyselect::any_of(proteomics_metadata_cols),
+        tidyselect::all_of(overlap_proteins)
+      )
+  )
+
+proteomics_l$protein_annotation <- proteomics_l$protein_annotation[cohort_names] %>%
+  purrr::map(~ .x %>% dplyr::filter(meta_id %in% overlap_proteins))
+
+make_cohort_expr <- function(df, cohort_name) {
+  df %>%
+    dplyr::select(LABID, tidyselect::all_of(overlap_proteins)) %>%
+    dplyr::mutate(
+      cohort = cohort_name,
+      sample_id = paste(cohort_name, LABID, sep = "_")
+    ) %>%
+    dplyr::select(sample_id, cohort, tidyselect::all_of(overlap_proteins))
+}
+
+SOLAR_expr_raw <- make_cohort_expr(proteomics_l$SOLAR, "SOLAR")
+CHS_expr_raw <- make_cohort_expr(proteomics_l$CHS, "CHS")
+BHRC_expr_raw <- make_cohort_expr(proteomics_l$BHRC, "BHRC")
+
+pooled_expr_raw <- dplyr::bind_rows(
+  SOLAR_expr_raw,
+  CHS_expr_raw,
+  BHRC_expr_raw
+)
+
+cat("Overlapping proteins across SOLAR, CHS, and BHRC:", length(overlap_proteins), "\n")
+print(table(pooled_expr_raw$cohort))
+```
+
+# WGCNA Helper Functions
+
+```{r wgcna-functions}
+WGCNA::allowWGCNAThreads()
+options(stringsAsFactors = FALSE)
+
+cor <- function(
+  x,
+  y = NULL,
+  use = "pairwise.complete.obs",
+  method = "pearson",
+  weights.x = NULL,
+  weights.y = NULL,
+  cosine = FALSE,
+  ...
+) {
+  stats::cor(x, y, use = use, method = method)
+}
+
+prepare_wgcna_expr <- function(df,
+                               protein_names,
+                               sample_cols = c("sample_id", "cohort"),
+                               max_missing = 0.20) {
+  sample_metadata <- df %>%
+    dplyr::select(tidyselect::all_of(sample_cols))
+
+  expr0 <- df %>%
+    dplyr::select(tidyselect::all_of(protein_names)) %>%
+    dplyr::mutate(dplyr::across(tidyselect::everything(), as.numeric)) %>%
+    as.data.frame()
+
+  keep_samples <- !apply(is.na(expr0), 1, all)
+  expr0 <- expr0[keep_samples, , drop = FALSE]
+  sample_metadata <- sample_metadata[keep_samples, , drop = FALSE]
+
+  protein_missing <- colMeans(is.na(expr0))
+  keep_missing <- names(protein_missing)[protein_missing <= max_missing]
+  expr1 <- expr0[, keep_missing, drop = FALSE]
+
+  protein_medians <- vapply(expr1, median, numeric(1), na.rm = TRUE)
+  expr1 <- as.data.frame(
+    Map(
+      function(x, med) {
+        x[is.na(x)] <- med
+        x
+      },
+      expr1,
+      protein_medians
+    )
+  )
+
+  protein_var <- vapply(expr1, var, numeric(1), na.rm = TRUE)
+  keep_var <- names(protein_var)[protein_var > 0]
+  expr2 <- expr1[, keep_var, drop = FALSE]
+
+  protein_center <- vapply(expr2, mean, numeric(1), na.rm = TRUE)
+  protein_scale <- vapply(expr2, stats::sd, numeric(1), na.rm = TRUE)
+
+  datExpr <- sweep(expr2, 2, protein_center, "-")
+  datExpr <- sweep(datExpr, 2, protein_scale, "/")
+  datExpr <- as.data.frame(datExpr)
+  rownames(datExpr) <- make.unique(sample_metadata$sample_id)
+
+  gsg <- WGCNA::goodSamplesGenes(datExpr, verbose = 3)
+
+  if (!gsg$allOK) {
+    good_proteins <- colnames(datExpr)[gsg$goodGenes]
+
+    datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes, drop = FALSE]
+    sample_metadata <- sample_metadata[gsg$goodSamples, , drop = FALSE]
+    protein_center <- protein_center[good_proteins]
+    protein_scale <- protein_scale[good_proteins]
+    protein_medians <- protein_medians[good_proteins]
+  }
+
+  list(
+    datExpr = datExpr,
+    sample_metadata = sample_metadata,
+    protein_center = protein_center[colnames(datExpr)],
+    protein_scale = protein_scale[colnames(datExpr)],
+    protein_medians = protein_medians[colnames(datExpr)]
+  )
+}
+
+prepare_reference_scaled_expr <- function(target_df,
+                                          reference_prep,
+                                          protein_names,
+                                          sample_cols = c("sample_id", "cohort")) {
+  target_meta <- target_df %>%
+    dplyr::select(tidyselect::all_of(sample_cols))
+
+  target_proteins <- protein_names %>%
+    intersect(names(target_df)) %>%
+    intersect(names(reference_prep$protein_center)) %>%
+    intersect(names(reference_prep$protein_scale)) %>%
+    intersect(names(reference_prep$protein_medians))
+
+  if (length(target_proteins) == 0) {
+    stop("No target proteins are available for SOLAR-reference scaling.")
+  }
+
+  target_expr <- target_df %>%
+    dplyr::select(tidyselect::all_of(target_proteins)) %>%
+    dplyr::mutate(dplyr::across(tidyselect::everything(), as.numeric)) %>%
+    as.data.frame()
+
+  for (protein in target_proteins) {
+    missing_idx <- is.na(target_expr[[protein]])
+    if (any(missing_idx)) {
+      target_expr[[protein]][missing_idx] <- reference_prep$protein_medians[[protein]]
+    }
+  }
+
+  target_expr <- sweep(
+    target_expr,
+    2,
+    reference_prep$protein_center[target_proteins],
+    "-"
+  )
+  target_expr <- sweep(
+    target_expr,
+    2,
+    reference_prep$protein_scale[target_proteins],
+    "/"
+  )
+  target_expr <- as.data.frame(target_expr)
+  rownames(target_expr) <- make.unique(target_meta$sample_id)
+
+  list(
+    datExpr = target_expr,
+    sample_metadata = target_meta
+  )
+}
+
+estimate_reference_module_loadings <- function(reference_datExpr,
+                                               module_colors,
+                                               reference_MEs) {
+  modules <- setdiff(sort(unique(module_colors)), "grey")
+
+  purrr::map_dfr(
+    modules,
+    function(module_name) {
+      module_proteins <- names(module_colors)[module_colors == module_name]
+      module_expr <- as.matrix(reference_datExpr[, module_proteins, drop = FALSE])
+
+      module_pca <- stats::prcomp(
+        module_expr,
+        center = FALSE,
+        scale. = FALSE
+      )
+
+      loading <- module_pca$rotation[, 1]
+      score <- as.numeric(module_expr %*% loading)
+      eigengene_name <- paste0("ME", module_name)
+
+      if (eigengene_name %in% names(reference_MEs)) {
+        sign_cor <- suppressWarnings(stats::cor(score, reference_MEs[[eigengene_name]], use = "pairwise.complete.obs"))
+        if (!is.na(sign_cor) && sign_cor < 0) {
+          loading <- -loading
+          score <- -score
+        }
+      }
+
+      tibble::tibble(
+        module = module_name,
+        eigengene = eigengene_name,
+        protein = names(loading),
+        loading = as.numeric(loading),
+        solar_score_cor = if (eigengene_name %in% names(reference_MEs)) {
+          suppressWarnings(stats::cor(score, reference_MEs[[eigengene_name]], use = "pairwise.complete.obs"))
+        } else {
+          NA_real_
+        }
+      )
+    }
+  )
+}
+
+project_module_eigengenes <- function(target_df,
+                                      reference_wgcna,
+                                      reference_prep,
+                                      cohort_name,
+                                      protein_names) {
+  module_df <- reference_wgcna$module_df %>%
+    dplyr::filter(module != "grey")
+
+  loading_df <- reference_wgcna$module_loadings
+
+  if (is.null(loading_df)) {
+    stop("The reference WGCNA object does not contain fixed SOLAR module loadings.")
+  }
+
+  projection_proteins <- loading_df$protein %>%
+    intersect(protein_names) %>%
+    intersect(names(target_df))
+
+  if (length(projection_proteins) == 0) {
+    stop("No non-grey SOLAR module proteins are available for projection.")
+  }
+
+  target_prep <- prepare_reference_scaled_expr(
+    target_df = target_df,
+    reference_prep = reference_prep,
+    protein_names = projection_proteins
+  )
+  target_expr <- target_prep$datExpr
+  target_meta <- target_prep$sample_metadata
+
+  projected_ME_list <- loading_df %>%
+    dplyr::filter(protein %in% projection_proteins) %>%
+    split(.$eigengene) %>%
+    purrr::map(
+      function(module_loadings) {
+        proteins <- module_loadings$protein
+        loadings <- module_loadings$loading
+        names(loadings) <- proteins
+
+        as.numeric(as.matrix(target_expr[, proteins, drop = FALSE]) %*% loadings[proteins])
+      }
+    )
+
+  projected_MEs <- as.data.frame(projected_ME_list, check.names = FALSE)
+
+  reference_me_names <- setdiff(names(reference_wgcna$MEs), "MEgrey")
+  projected_MEs <- projected_MEs[, intersect(reference_me_names, names(projected_MEs)), drop = FALSE]
+
+  dplyr::bind_cols(
+    target_meta,
+    tibble::as_tibble(projected_MEs)
+  ) %>%
+    dplyr::mutate(
+      projected_from = "SOLAR",
+      projection_method = "fixed_SOLAR_PC1_loadings"
+    )
+}
+```
+
+# Overall WGCNA Across Cohorts
+
+## WGCNA model
+
+```{r pooled-wgcna}
+pooled_prep <- prepare_wgcna_expr(
+  df = pooled_expr_raw,
+  protein_names = overlap_proteins,
+  sample_cols = c("sample_id", "cohort"),
+  max_missing = max_protein_missing
+)
+
+cat("Pooled WGCNA matrix dimensions:", dim(pooled_prep$datExpr), "\n")
+
+pooled_sft <- WGCNA::pickSoftThreshold(
+  pooled_prep$datExpr,
+  powerVector = powers,
+  networkType = network_type,
+  verbose = 5
+)
+
+pooled_soft_power <- pooled_sft$powerEstimate
+
+if (is.na(pooled_soft_power)) {
+  pooled_soft_power <- fallback_power
+}
+
+pooled_net <- WGCNA::blockwiseModules(
+  pooled_prep$datExpr,
+  power = pooled_soft_power,
+  networkType = network_type,
+  TOMType = tom_type,
+  minModuleSize = min_module_size,
+  reassignThreshold = 0,
+  mergeCutHeight = merge_cut_height,
+  numericLabels = TRUE,
+  pamRespectsDendro = FALSE,
+  verbose = 3
+)
+
+pooled_module_colors <- WGCNA::labels2colors(pooled_net$colors)
+names(pooled_module_colors) <- colnames(pooled_prep$datExpr)
+pooled_MEs0 <- WGCNA::moduleEigengenes(
+  pooled_prep$datExpr,
+  colors = pooled_module_colors
+)$eigengenes
+pooled_MEs0 <- WGCNA::orderMEs(pooled_MEs0)
+
+pooled_module_df <- tibble::tibble(
+  protein = colnames(pooled_prep$datExpr),
+  module = pooled_module_colors
+)
+
+pooled_wgcna <- list(
+  analysis = "pooled",
+  datExpr = pooled_prep$datExpr,
+  soft_power = pooled_soft_power,
+  soft_threshold_fit = tibble::as_tibble(pooled_sft$fitIndices),
+  net = pooled_net,
+  module_colors = pooled_module_colors,
+  MEs = pooled_MEs0,
+  module_df = pooled_module_df
+)
+
+pooled_MEs <- dplyr::bind_cols(
+  pooled_prep$sample_metadata,
+  tibble::as_tibble(pooled_wgcna$MEs)
+)
+
+table(pooled_wgcna$module_colors)
+```
+
+## Module overview
+
+```{r pooled-module-overview}
+pooled_module_overview <- pooled_wgcna$module_df %>%
+  dplyr::count(module, name = "n_proteins") %>%
+  dplyr::arrange(dplyr::desc(n_proteins))
+
+pooled_module_overview %>%
+  dplyr::summarise(
+    n_modules = sum(module != "grey"),
+    n_unassigned_proteins = sum(n_proteins[module == "grey"]),
+    n_module_proteins = sum(n_proteins[module != "grey"])
+  )
+
+pooled_module_overview %>%
+  kbl(
+    caption = "Number of proteins assigned to each pooled WGCNA module."
+  ) %>%
+  kable_paper("hover", full_width = T)
+```
+
+# SOLAR Reference WGCNA
+
+```{r solar-reference-wgcna}
+SOLAR_prep <- prepare_wgcna_expr(
+  df = SOLAR_expr_raw,
+  protein_names = overlap_proteins,
+  sample_cols = c("sample_id", "cohort"),
+  max_missing = max_protein_missing
+)
+
+cat("SOLAR reference WGCNA matrix dimensions:", dim(SOLAR_prep$datExpr), "\n")
+
+SOLAR_sft <- WGCNA::pickSoftThreshold(
+  SOLAR_prep$datExpr,
+  powerVector = powers,
+  networkType = network_type,
+  verbose = 5
+)
+
+SOLAR_soft_power <- SOLAR_sft$powerEstimate
+
+if (is.na(SOLAR_soft_power)) {
+  SOLAR_soft_power <- fallback_power
+}
+
+SOLAR_net <- WGCNA::blockwiseModules(
+  SOLAR_prep$datExpr,
+  power = SOLAR_soft_power,
+  networkType = network_type,
+  TOMType = tom_type,
+  minModuleSize = min_module_size,
+  reassignThreshold = 0,
+  mergeCutHeight = merge_cut_height,
+  numericLabels = TRUE,
+  pamRespectsDendro = FALSE,
+  verbose = 3
+)
+
+SOLAR_module_colors <- WGCNA::labels2colors(SOLAR_net$colors)
+names(SOLAR_module_colors) <- colnames(SOLAR_prep$datExpr)
+SOLAR_MEs0 <- WGCNA::moduleEigengenes(
+  SOLAR_prep$datExpr,
+  colors = SOLAR_module_colors
+)$eigengenes
+SOLAR_MEs0 <- WGCNA::orderMEs(SOLAR_MEs0)
+
+SOLAR_module_df <- tibble::tibble(
+  protein = colnames(SOLAR_prep$datExpr),
+  module = SOLAR_module_colors
+)
+
+SOLAR_module_loadings <- estimate_reference_module_loadings(
+  reference_datExpr = SOLAR_prep$datExpr,
+  module_colors = SOLAR_module_colors,
+  reference_MEs = SOLAR_MEs0
+)
+
+SOLAR_wgcna <- list(
+  analysis = "SOLAR_reference",
+  datExpr = SOLAR_prep$datExpr,
+  soft_power = SOLAR_soft_power,
+  soft_threshold_fit = tibble::as_tibble(SOLAR_sft$fitIndices),
+  net = SOLAR_net,
+  module_colors = SOLAR_module_colors,
+  MEs = SOLAR_MEs0,
+  module_df = SOLAR_module_df,
+  module_loadings = SOLAR_module_loadings
+)
+
+SOLAR_MEs <- dplyr::bind_cols(
+  SOLAR_prep$sample_metadata,
+  tibble::as_tibble(SOLAR_wgcna$MEs)
+)
+
+table(SOLAR_wgcna$module_colors)
+```
+
+## Module overview
+
+```{r solar-module-overview}
+SOLAR_module_overview <- SOLAR_wgcna$module_df %>%
+  dplyr::count(module, name = "n_proteins") %>%
+  dplyr::arrange(dplyr::desc(n_proteins))
+
+SOLAR_module_overview %>%
+  dplyr::summarise(
+    n_modules = sum(module != "grey"),
+    n_unassigned_proteins = sum(n_proteins[module == "grey"]),
+    n_module_proteins = sum(n_proteins[module != "grey"])
+  )
+
+SOLAR_module_overview %>%
+  kbl(
+    caption = "Number of proteins assigned to each SOLAR reference WGCNA module."
+  ) %>%
+  kable_paper("hover")
+```
+
+# SOLAR Module Preservation in CHS and BHRC
+
+Module preservation tests whether the SOLAR-derived module co-expression structure is retained in CHS and BHRC.
+Unlike eigengene projection, this step does not create participant-level scores.
+Instead, it evaluates whether proteins assigned to each SOLAR module remain similarly connected in the target cohorts.
+The main statistics are `Zsummary.pres` and `medianRank.pres`: larger `Zsummary.pres` and smaller `medianRank.pres` indicate stronger preservation.
+
+```{r solar-module-preservation}
+preservation_proteins <- colnames(SOLAR_prep$datExpr) %>%
+  intersect(names(CHS_expr_raw)) %>%
+  intersect(names(BHRC_expr_raw))
+
+CHS_preservation_prep <- prepare_reference_scaled_expr(
+  target_df = CHS_expr_raw,
+  reference_prep = SOLAR_prep,
+  protein_names = preservation_proteins
+)
+
+BHRC_preservation_prep <- prepare_reference_scaled_expr(
+  target_df = BHRC_expr_raw,
+  reference_prep = SOLAR_prep,
+  protein_names = preservation_proteins
+)
+
+preservation_modules <- SOLAR_wgcna$module_colors[preservation_proteins]
+
+extract_preservation_table <- function(module_preservation, test_cohort) {
+  ref_name <- "ref.SOLAR"
+  test_name <- paste0("inColumnsAlsoPresentIn.", test_cohort)
+
+  z_tbl <- module_preservation$preservation$Z[[ref_name]][[test_name]] %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("module") %>%
+    tibble::as_tibble()
+
+  observed_tbl <- module_preservation$preservation$observed[[ref_name]][[test_name]] %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("module") %>%
+    tibble::as_tibble()
+
+  z_cols <- intersect(
+    c("module", "moduleSize", "Zsummary.pres", "Zdensity.pres", "Zconnectivity.pres"),
+    names(z_tbl)
+  )
+  observed_cols <- intersect(
+    c("module", "medianRank.pres"),
+    names(observed_tbl)
+  )
+
+  z_tbl %>%
+    dplyr::select(tidyselect::all_of(z_cols)) %>%
+    dplyr::left_join(
+      observed_tbl %>%
+        dplyr::select(tidyselect::all_of(observed_cols)),
+      by = "module"
+    ) %>%
+    dplyr::mutate(
+      cohort = test_cohort,
+      preservation_interpretation = dplyr::case_when(
+        !is.na(Zsummary.pres) & Zsummary.pres > 10 ~ "Strong preservation",
+        !is.na(Zsummary.pres) & Zsummary.pres >= 2 ~ "Moderate/weak preservation",
+        !is.na(Zsummary.pres) ~ "No evidence of preservation",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    dplyr::select(cohort, tidyselect::everything()) %>%
+    dplyr::arrange(module)
+}
+
+module_preservation_rds <- fs::path(dir_wgcna, "SOLAR_module_preservation.rds")
+
+if (fs::file_exists(module_preservation_rds) && !rerun_module_preservation) {
+  SOLAR_module_preservation_saved <- readRDS(module_preservation_rds)
+  SOLAR_module_preservation <- SOLAR_module_preservation_saved$module_preservation
+
+  if ("module_preservation_summary" %in% names(SOLAR_module_preservation_saved)) {
+    SOLAR_module_preservation_summary <- SOLAR_module_preservation_saved$module_preservation_summary
+  } else {
+    SOLAR_module_preservation_summary <- dplyr::bind_rows(
+      extract_preservation_table(SOLAR_module_preservation, "CHS"),
+      extract_preservation_table(SOLAR_module_preservation, "BHRC")
+    )
+  }
+} else {
+  multi_expr <- list(
+    SOLAR = list(data = SOLAR_prep$datExpr[, preservation_proteins, drop = FALSE]),
+    CHS = list(data = CHS_preservation_prep$datExpr[, preservation_proteins, drop = FALSE]),
+    BHRC = list(data = BHRC_preservation_prep$datExpr[, preservation_proteins, drop = FALSE])
+  )
+
+  multi_color <- list(
+    SOLAR = preservation_modules
+  )
+
+  set.seed(module_preservation_seed)
+  SOLAR_module_preservation <- WGCNA::modulePreservation(
+    multiData = multi_expr,
+    multiColor = multi_color,
+    referenceNetworks = 1,
+    nPermutations = module_preservation_permutations,
+    networkType = network_type,
+    verbose = 3,
+    randomSeed = module_preservation_seed
+  )
+
+  SOLAR_module_preservation_summary <- dplyr::bind_rows(
+    extract_preservation_table(SOLAR_module_preservation, "CHS"),
+    extract_preservation_table(SOLAR_module_preservation, "BHRC")
+  )
+}
+
+SOLAR_module_preservation_summary <- SOLAR_module_preservation_summary %>%
+  dplyr::filter(module %in% setdiff(unique(SOLAR_wgcna$module_df$module), "grey"))
+
+SOLAR_module_preservation_summary %>%
+  dplyr::arrange(desc(cohort), desc(moduleSize)) |>
+  kbl(
+    caption = "Preservation of SOLAR reference WGCNA modules in CHS and BHRC."
+  ) %>%
+  kable_paper("hover")
+```
+
+## Supplemental Table: Module Preservation
+
+```{r supplemental-module-preservation-table}
+module_preservation_supplemental_table <- SOLAR_module_preservation_summary %>%
+  dplyr::transmute(
+    `Validation cohort` = cohort,
+    `SOLAR module` = module,
+    `Module size` = moduleSize,
+    `Zsummary preservation` = round(Zsummary.pres, 2),
+    `Zdensity preservation` = round(Zdensity.pres, 2),
+    `Zconnectivity preservation` = round(Zconnectivity.pres, 2),
+    `Median rank preservation` = round(medianRank.pres, 2),
+    `Interpretation` = preservation_interpretation
+  ) %>%
+  dplyr::arrange(`Validation cohort`, dplyr::desc(`Module size`), `SOLAR module`)
+
+# readr::write_csv(
+#   module_preservation_supplemental_table,
+#   fs::path(dir_manuscript, "Supplemental_Table_Module_Preservation.csv")
+# )
+
+module_preservation_supplemental_table %>%
+  kbl(
+    caption = "Supplemental Table. Preservation of SOLAR reference WGCNA protein modules in CHS and BHRC."
+  ) %>%
+  kable_paper("hover", full_width = FALSE)
+```
+
+Columns in `SOLAR_module_preservation_summary`:
+
+- `Zsummary.pres`: composite preservation Z statistic. Values greater than 10 indicate strong preservation, values from 2 to 10 indicate moderate or weak evidence of preservation, and values below 2 indicate no clear evidence of preservation.
+- `Zdensity.pres`: preservation statistic for whether proteins in the module remain densely connected in the target cohort.
+- `Zconnectivity.pres`: preservation statistic for whether the within-module connectivity pattern is retained in the target cohort.
+- `medianRank.pres`: relative preservation rank across modules. Smaller values indicate stronger preservation. This statistic is useful because it is less dependent on module size than `Zsummary.pres`.
+- `preservation_interpretation`: text interpretation derived from `Zsummary.pres`.
+
+```{r save-solar-module-preservation}
+saveRDS(
+  list(
+    module_preservation = SOLAR_module_preservation,
+    module_preservation_summary = SOLAR_module_preservation_summary,
+    module_preservation_supplemental_table = module_preservation_supplemental_table
+  ),
+  fs::path(dir_wgcna, "SOLAR_module_preservation.rds")
+)
+```
+
+# SOLAR Module Projection to CHS and BHRC
+
+The SOLAR reference modules are projected into CHS and BHRC with fixed SOLAR eigengene loadings.
+For each non-grey SOLAR module, the first principal component loading vector is estimated once in the standardized SOLAR protein matrix and aligned to the direction of the original SOLAR WGCNA eigengene.
+CHS and BHRC protein abundances are then imputed with SOLAR medians, standardized using SOLAR means and standard deviations, and multiplied by the fixed SOLAR loading vectors.
+Thus, target-cohort module scores use SOLAR module membership and SOLAR eigengene weights rather than recomputing module eigengenes separately inside each target cohort.
+
+```{r solar-module-projection}
+CHS_projected_MEs <- project_module_eigengenes(
+  target_df = CHS_expr_raw,
+  reference_wgcna = SOLAR_wgcna,
+  reference_prep = SOLAR_prep,
+  cohort_name = "CHS",
+  protein_names = overlap_proteins
+)
+
+BHRC_projected_MEs <- project_module_eigengenes(
+  target_df = BHRC_expr_raw,
+  reference_wgcna = SOLAR_wgcna,
+  reference_prep = SOLAR_prep,
+  cohort_name = "BHRC",
+  protein_names = overlap_proteins
+)
+
+projected_MEs <- dplyr::bind_rows(
+  CHS_projected_MEs,
+  BHRC_projected_MEs
+)
+
+print(table(projected_MEs$cohort))
+```
+
+# Saved WGCNA Models
+
+```{r save-wgcna-model}
+WGCNA_parameters <- list(
+  cohort_names = cohort_names,
+  max_protein_missing = max_protein_missing,
+  powers = powers,
+  fallback_power = fallback_power,
+  min_module_size = min_module_size,
+  merge_cut_height = merge_cut_height,
+  network_type = network_type,
+  tom_type = tom_type,
+  module_preservation_permutations = module_preservation_permutations,
+  module_preservation_seed = module_preservation_seed
+)
+
+pooled_WGCNA_model <- list(
+  parameters = WGCNA_parameters,
+  prep = pooled_prep,
+  wgcna = pooled_wgcna,
+  module_overview = pooled_module_overview,
+  module_eigengenes = pooled_MEs
+)
+
+SOLAR_WGCNA_model <- list(
+  parameters = WGCNA_parameters,
+  reference = list(
+    prep = SOLAR_prep,
+    wgcna = SOLAR_wgcna,
+    module_overview = SOLAR_module_overview,
+    module_eigengenes = SOLAR_MEs
+  ),
+  preservation = list(
+    module_preservation = SOLAR_module_preservation,
+    module_preservation_summary = SOLAR_module_preservation_summary,
+    module_preservation_supplemental_table = module_preservation_supplemental_table,
+    CHS_preservation_prep = CHS_preservation_prep,
+    BHRC_preservation_prep = BHRC_preservation_prep
+  ),
+  projection = list(
+    CHS_projected_MEs = CHS_projected_MEs,
+    BHRC_projected_MEs = BHRC_projected_MEs,
+    projected_MEs = projected_MEs
+  )
+)
+
+saveRDS(pooled_WGCNA_model, fs::path(dir_wgcna, "pooled_WGCNA_model.rds"))
+saveRDS(SOLAR_WGCNA_model, fs::path(dir_wgcna, "SOLAR_WGCNA_model.rds"))
+```

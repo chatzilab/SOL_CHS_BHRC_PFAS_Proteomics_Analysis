@@ -1,0 +1,620 @@
+﻿---
+title: "SOL, CHS, and BHRC PFAS PWAS"
+author: "Zhenjiang Li"
+date: today
+toc: true
+toc_expand: 2
+format:
+  html:
+    code-fold: true
+    html-math-method: katex
+    fontsize: 16pt
+    grid:
+      sidebar-width: 0px
+      body-width: 1500px
+      margin-width: 500px
+      gutter-width: 1.5rem
+embed-resources: true
+editor: visual
+editor_options:
+  chunk_output_type: console
+---
+
+## Environment Setup {.hidden}
+
+```{=html}
+<style type="text/css">
+caption, .table-caption {
+  text-align: left;
+}
+</style>
+```
+
+```{r setup}
+#| echo: false
+
+options(scipen=999)
+
+library(fs)
+library(here)
+i_am("1_scripts/!analytic_workflow_pfas_PWAS.qmd")
+
+source(here::here("1_scripts", "!libraries.R"))
+source(here::here("1_scripts", "!directories.R"))
+source(here::here("1_scripts", "!functions.R"))
+
+options(knitr.table.format = "html")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+```{r}
+#| label: shorten-long-path
+#| include: false
+
+create_shortcut <- function(path, short_cut, drive)
+{
+  return(
+    sub(gsub("\\)", "\\\\)", gsub("\\(", "\\\\(", short_cut)), paste0(drive, ":"), path))
+}
+
+if(nchar(dir_data) > 80)
+{
+  system("subst x: /D")
+  short_cut <- dir_home |> dirname()
+  system(paste0("subst x: \"", short_cut, "\""))
+
+  dir_objects_names <- ls(pattern = "^dir_")
+
+  dir_list <- mget(dir_objects_names)
+
+  dir_list_shortened <- lapply(
+    dir_list,
+    function(y) create_shortcut(y, short_cut, "x")
+  )
+  list2env(dir_list_shortened, envir = .GlobalEnv)
+}
+
+rm(list = intersect(
+  c("dir_objects_names", "short_cut", "dir_list", "dir_list_shortened"),
+  ls()
+))
+```
+
+# Parameters
+
+```{r}
+SOLAR_pfas_names <- c("pfos_log2", "pfoa_log2", "pfna_log2", "pfda_log2", "pfhxs_log2", "pfhps_log2")
+CHS_pfas_names <- c("ma_pfos_log2", "ma_pfoa_log2", "ma_pfna_log2", "ma_pfda_log2", "ma_pfhxs_log2", "ma_pfhps_log2")
+BHRC_pfas_names <- c("PFOS_det60_imputed_log2", "PFOA_det60_imputed_log2", "PFNA_det60_imputed_log2", "PFDA_det60_imputed_log2", "PFHxS_det60_imputed_log2", "PFHpS_det60_imputed_log2")
+PFAS_abbrev_names <- c("PFOS", "PFOA", "PFNA", "PFDA", "PFHxS", "PFHpS")
+
+SOLAR_covars <- c("age", "sex", "bmiz", "tanner", "wave", "edu_house2")
+CHS_covars <- c("ma_age", "ma_sex", "ma_hisp", "ma_parental_edu", "ma_bmi")
+BHRC_raw_covars <- c("AGE_AT_VISIT", "BMI1", "GENDER", "YEARS_EDU", "ADA2010_DM")
+BHRC_covars <- c("AGE_AT_VISIT", "BMI1", "GENDER", "edu_3level", "ADA2010_DM")
+
+qgcomp_q <- 4
+dir_pwas <- fs::path(dir_temp_data, "PFAS_PWAS")
+fs::dir_create(dir_pwas)
+```
+
+# Data Preparation
+
+## Bridged proteomics
+
+```{r}
+proteomics_l <- readRDS(fs::path(
+  dir_data,
+  "ShARP_BHRC_Shared",
+  "ShARP_BHRC_Data_Shared",
+  "OLINK_proteomics_bridged_BHRC_SOLAR_CHS.rds"
+  ))
+
+cohort_names <- c("SOLAR", "CHS", "BHRC")
+proteomics_metadata_cols <- c("LABID", "study", "Batch")
+
+overlap_proteins <- proteomics_l[cohort_names] %>%
+  purrr::map(~ setdiff(names(.x), proteomics_metadata_cols)) %>%
+  purrr::reduce(intersect)
+
+proteomics_l <- proteomics_l[c(cohort_names, "protein_annotation")]
+
+proteomics_l[cohort_names] <- proteomics_l[cohort_names] %>%
+  purrr::map(~ .x %>% dplyr::select(tidyselect::any_of(proteomics_metadata_cols), tidyselect::all_of(overlap_proteins)))
+
+proteomics_l$protein_annotation <- proteomics_l$protein_annotation[cohort_names] %>%
+  purrr::map(~ .x %>% dplyr::filter(meta_id %in% overlap_proteins))
+
+SOL_prote <- proteomics_l$SOLAR %>%
+  dplyr::mutate(id = gsub("-", "_", tolower(LABID))) %>%
+  dplyr::select(id, tidyselect::all_of(overlap_proteins))
+
+CHS_prote <- proteomics_l$CHS %>%
+  dplyr::rename(SampleID = LABID) %>%
+  dplyr::select(SampleID, tidyselect::all_of(overlap_proteins))
+
+BHRC_prote <- proteomics_l$BHRC %>%
+  dplyr::select(LABID, tidyselect::all_of(overlap_proteins))
+
+proteomics_property <- proteomics_l$protein_annotation$SOLAR %>%
+  dplyr::transmute(
+    OlinkID = meta_id,
+    UniProt = meta_Uniprot,
+    Assay = meta_id,
+    Protein = meta_Assay,
+    Panel = NA_character_
+  )
+
+cat("Overlapping proteins across SOLAR, CHS, and BHRC:", length(overlap_proteins), "\n")
+names(proteomics_l)
+```
+
+## SOLAR
+
+```{r solar-data-prep}
+load(fs::path(
+  dir_data,
+  "ShARP_SOLAR_Shared",
+  "ShARP_SOLAR_Data_Shared",
+  "Solar_Analysis_20251003.Rda"
+))
+SOLAR <- analysis_df
+rm(analysis_df)
+
+SOLAR_visit1 <- SOLAR %>%
+  dplyr::group_by(id) %>%
+  dplyr::filter(visit == min(visit)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    age = as.numeric(age),
+    bmiz = as.numeric(bmiz),
+    edu_house2 = dplyr::recode(
+      edu_house,
+      "Missing" = "Missing",
+      "Did not graduate high school" = "< High School",
+      "High school graduate" = "High School Grad",
+      "Partial college (at least one year) or specialized training" = "> High School",
+      "Completed college/university" = "> High School",
+      "Graduate professional training (graduate degree)" = "> High School"
+    ),
+    dplyr::across(tidyselect::any_of(c("sex", "tanner", "wave", "edu_house2")), as.factor)
+  ) %>%
+  dplyr::select(
+    id,
+    tidyselect::all_of(SOLAR_pfas_names),
+    tidyselect::all_of(SOLAR_covars),
+    bmi_og
+  )
+
+colSums(is.na(SOLAR_visit1))
+
+SOLAR_working_df <- SOL_prote %>%
+  dplyr::left_join(SOLAR_visit1, by = "id")
+
+colSums(is.na(SOLAR_working_df))
+dim(SOLAR_working_df)
+```
+
+## CHS
+
+```{r chs-data-prep}
+CHS <- readRDS(fs::path(
+  dir_data,
+  "ShARP_CHS_Shared",
+  "ShARP_CHS_Data_Shared",
+  "CHS MetaAir MetaChem Cleaned Redcap and Exposures Outcome Data long V5.rds"))
+
+id_link <- readxl::read_xlsx(
+  fs::path(
+  here::here() |> dirname() |> dirname() |> dirname() |> dirname() |> dirname(),
+  "Chatzi Projects and Analyses", "Env Chem SOL-CHS",
+  "Lab Analysis and sample shipments", "Metachem_sample_inventory_master_040522.xlsx"),
+  sheet = "Plasma"
+)
+
+id_link_simp <- id_link %>%
+  dplyr::mutate(
+    SampleID = `Plasma Aliquot ID`,
+    id = `Sample Name`
+  ) %>%
+  dplyr::mutate(
+    id = as.character(id)
+  ) %>%
+  dplyr::select(SampleID, id)
+
+CHS_prote <- CHS_prote |>
+  dplyr::left_join(
+    id_link_simp,
+    by = c("SampleID")
+  ) %>%
+  dplyr::select(id, tidyselect::everything(), -SampleID)
+duplicated(CHS_prote$id) |> sum() # all unique IDs
+
+CHS_baseline <- CHS %>%
+  dplyr::filter(study == "MetaAir") %>%
+  dplyr::select(
+    id,
+    tidyselect::all_of(CHS_pfas_names),
+    tidyselect::all_of(CHS_covars)
+  ) %>%
+  dplyr::mutate(
+    ma_age = as.numeric(ma_age),
+    ma_bmi = as.numeric(ma_bmi),
+    ma_hisp = as.factor(ma_hisp),
+    ma_parental_edu = dplyr::na_if(ma_parental_edu, -1),
+    ma_parental_edu = as.factor(ma_parental_edu),
+    ma_sex = as.factor(ma_sex)
+  )
+
+colSums(is.na(CHS_baseline))
+
+CHS_analysis_df <- CHS_baseline %>%
+  dplyr::filter(complete.cases(.))
+
+CHS_working_df <- dplyr::left_join(
+  CHS_prote,
+  CHS_analysis_df,
+  by = "id"
+)
+
+colSums(is.na(CHS_working_df))
+dim(CHS_working_df)
+```
+
+## BHRC
+
+```{r}
+BHRC <- readRDS(
+  fs::path(
+    dir_data,
+    "ShARP_BHRC_Shared",
+    "ShARP_BHRC_Data_Shared",
+    "CCHC_usc250_long_12172025.rds"
+  )
+) |>
+  dplyr::filter(visit %in% c(1,2))
+  # dplyr::filter(visit %in% c(1))
+
+BHRC_pfas <- readRDS(
+  fs::path(
+    dir_data,
+    "ShARP_BHRC_Shared",
+    "ShARP_BHRC_Data_Shared",
+    "PFAS_CCHC_three_sets.rds"
+  )
+)
+
+BHRC_analysis_df <- BHRC %>%
+  dplyr::filter(visit == 1) %>%
+  dplyr::select(
+    RRID,
+    LABID,
+    visit,
+    tidyselect::all_of(BHRC_raw_covars)
+  ) %>%
+  dplyr::left_join(
+    BHRC_pfas %>%
+      dplyr::select(RRID, tidyselect::all_of(BHRC_pfas_names)),
+    by = "RRID"
+  ) %>%
+  dplyr::mutate(
+    AGE_AT_VISIT = as.numeric(AGE_AT_VISIT),
+    BMI1 = as.numeric(BMI1),
+    GENDER = as.factor(GENDER),
+    YEARS_EDU_code = code_from_years_edu(YEARS_EDU),
+    edu_3level = bhrc_edu_3level(YEARS_EDU_code),
+    ADA2010_DM = as.factor(ADA2010_DM)
+  ) %>%
+  dplyr::filter(complete.cases(dplyr::select(., tidyselect::all_of(c(BHRC_pfas_names, BHRC_covars))))) %>%
+  dplyr::arrange(LABID, visit) %>%
+  dplyr::distinct(LABID, .keep_all = TRUE)
+
+BHRC_working_df <- BHRC_prote %>%
+  dplyr::left_join(BHRC_analysis_df, by = "LABID")
+
+colSums(is.na(BHRC_working_df))
+dim(BHRC_working_df)
+```
+
+# Table 1
+
+```{r}
+lapply(
+  list(
+    SOLAR_working_df$age,
+    CHS_working_df$ma_age,
+    BHRC_working_df$AGE_AT_VISIT
+  ),
+  function(x) range(x, na.rm = T)
+)
+
+table1::table1(
+  as.formula(paste0("~", paste(SOLAR_covars, collapse = "+"), "+bmi_og")), data = SOLAR_working_df
+)
+table1::table1(
+  as.formula(paste0("~", paste(CHS_covars, collapse = "+"))), data = CHS_working_df
+)
+table1::table1(
+  as.formula(paste0("~", paste(BHRC_covars, collapse = "+"))), data = BHRC_working_df
+)
+
+pfas_summary_by_cohort <- function(df, cohort, pfas_names) {
+  pfas_name_map <- stats::setNames(pfas_names, PFAS_abbrev_names)
+
+  df %>%
+    dplyr::select(tidyselect::all_of(pfas_names)) %>%
+    dplyr::rename(tidyselect::all_of(pfas_name_map)) %>%
+    tidyr::pivot_longer(
+      cols = tidyselect::all_of(PFAS_abbrev_names),
+      names_to = "PFAS",
+      values_to = "log2_value"
+    ) %>%
+    dplyr::mutate(
+      concentration = 2^log2_value
+    ) %>%
+    dplyr::group_by(PFAS) %>%
+    dplyr::summarise(
+      cohort = cohort,
+      median = stats::median(concentration, na.rm = TRUE),
+      q1 = stats::quantile(concentration, probs = 0.25, na.rm = TRUE, names = FALSE),
+      q3 = stats::quantile(concentration, probs = 0.75, na.rm = TRUE, names = FALSE),
+      .groups = "drop"
+    )
+}
+
+pfas_concentration_table1 <- dplyr::bind_rows(
+  pfas_summary_by_cohort(SOLAR_working_df, "SOLAR", SOLAR_pfas_names),
+  pfas_summary_by_cohort(CHS_working_df, "CHS", CHS_pfas_names),
+  pfas_summary_by_cohort(BHRC_working_df, "BHRC", BHRC_pfas_names)
+) %>%
+  dplyr::mutate(
+    PFAS = factor(PFAS, levels = PFAS_abbrev_names),
+    median_iqr = sprintf("%.2f (%.2f, %.2f)", median, q1, q3)
+  ) %>%
+  dplyr::select(PFAS, cohort, median_iqr) %>%
+  tidyr::pivot_wider(names_from = cohort, values_from = median_iqr) %>%
+  dplyr::arrange(PFAS)
+
+pfas_concentration_table1 %>%
+  kableExtra::kbl(
+    caption = "Common PFAS concentrations across cohorts, median (Q1, Q3), original concentration scale."
+  ) %>%
+  kableExtra::kable_styling(full_width = FALSE)
+
+```
+
+# PWAS
+
+This section performs two proteome-wide screening analyses in each cohort.
+First, each PFAS compound is tested separately against every protein using `epiomics::owas()` with cohort-specific covariate adjustment.
+Second, the six PFAS compounds are tested jointly as a mixture using `epiomics::owas_qgcomp()`.
+Only two combined result files are saved because the downstream Praxis-BGM workflow only needs the screening results.
+
+## Analysis Helpers
+
+```{r pwas-helpers}
+prepare_pwas_df <- function(df, id_col, pfas_names, covars, protein_names) {
+  df %>%
+    dplyr::select(
+      tidyselect::all_of(id_col),
+      tidyselect::all_of(pfas_names),
+      tidyselect::all_of(covars),
+      tidyselect::all_of(protein_names)
+    ) %>%
+    dplyr::filter(
+      stats::complete.cases(dplyr::select(., tidyselect::all_of(c(pfas_names, covars))))
+    )
+}
+
+annotate_single_pfas_results <- function(res, cohort, pfas_var, pfas_names) {
+  res %>%
+    dplyr::mutate(
+      cohort = cohort,
+      pfas = pfas_var,
+      pfas_abbrev = PFAS_abbrev_names[match(pfas_var, pfas_names)],
+      adjusted_pval_BH = stats::p.adjust(p_value, method = "BH"),
+      adjusted_pval_BY = stats::p.adjust(p_value, method = "BY"),
+      estimate_beta = estimate,
+      se_beta = se,
+      ci_beta_low = estimate_beta - 1.96 * se_beta,
+      ci_beta_high = estimate_beta + 1.96 * se_beta
+    )
+}
+
+standardize_mixture_feature_column <- function(res) {
+  if ("feature" %in% names(res) && !"feature_name" %in% names(res)) {
+    res <- dplyr::rename(res, feature_name = feature)
+  }
+  res
+}
+
+run_cohort_single_pwas <- function(df, cohort, pfas_names, covars, protein_names) {
+  purrr::map_dfr(
+    pfas_names,
+    function(pfas_var) {
+      epiomics::owas(
+        df = df,
+        var = pfas_var,
+        omics = protein_names,
+        covars = covars,
+        var_exposure_or_outcome = "exposure",
+        family = "gaussian"
+      ) %>%
+        annotate_single_pfas_results(cohort, pfas_var, pfas_names)
+    }
+  ) %>%
+    dplyr::left_join(proteomics_property, by = c("feature_name" = "Assay")) %>%
+    dplyr::relocate(
+      cohort,
+      pfas,
+      pfas_abbrev,
+      feature_name,
+      Protein,
+      UniProt,
+      OlinkID,
+      Panel,
+      .before = estimate
+    )
+}
+
+run_cohort_mixture_pwas <- function(df, cohort, pfas_names, covars, protein_names) {
+  epiomics::owas_qgcomp(
+    df = df,
+    expnms = pfas_names,
+    omics = protein_names,
+    covars = covars,
+    q = qgcomp_q,
+    confidence_level = 0.95,
+    family = "gaussian"
+  ) %>%
+    standardize_mixture_feature_column() %>%
+    dplyr::mutate(
+      cohort = cohort,
+      mixture = "PFAS mixture",
+      pfas = "PFAS mixture",
+      pfas_abbrev = "PFAS mixture",
+      adjusted_pval_BH = stats::p.adjust(p_value, method = "BH"),
+      adjusted_pval_BY = stats::p.adjust(p_value, method = "BY"),
+      estimate_beta = psi,
+      ci_beta_low = lcl_psi,
+      ci_beta_high = ucl_psi
+    ) %>%
+    dplyr::left_join(proteomics_property, by = c("feature_name" = "Assay")) %>%
+    dplyr::relocate(
+      cohort,
+      mixture,
+      pfas,
+      pfas_abbrev,
+      feature_name,
+      Protein,
+      UniProt,
+      OlinkID,
+      Panel,
+      .before = estimate_beta
+    )
+}
+```
+
+## Complete-Case PWAS Inputs
+
+```{r pwas-inputs}
+SOLAR_pwas_df <- SOLAR_working_df %>%
+  prepare_pwas_df("id", SOLAR_pfas_names, SOLAR_covars, overlap_proteins)
+
+CHS_pwas_df <- CHS_working_df %>%
+  prepare_pwas_df("id", CHS_pfas_names, CHS_covars, overlap_proteins)
+
+BHRC_pwas_df <- BHRC_working_df %>%
+  prepare_pwas_df("LABID", BHRC_pfas_names, BHRC_covars, overlap_proteins)
+
+tibble::tibble(
+  cohort = cohort_names,
+  n_participants = c(nrow(SOLAR_pwas_df), nrow(CHS_pwas_df), nrow(BHRC_pwas_df)),
+  n_pfas = length(PFAS_abbrev_names),
+  n_proteins = length(overlap_proteins)
+) %>%
+  kableExtra::kbl(caption = "Complete-case PWAS input dimensions.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+## Single-PFAS PWAS
+
+```{r single-pfas-pwas}
+SOLAR_PWAS_results <- run_cohort_single_pwas(
+  df = SOLAR_pwas_df,
+  cohort = "SOLAR",
+  pfas_names = SOLAR_pfas_names,
+  covars = SOLAR_covars,
+  protein_names = overlap_proteins
+)
+
+CHS_PWAS_results <- run_cohort_single_pwas(
+  df = CHS_pwas_df,
+  cohort = "CHS",
+  pfas_names = CHS_pfas_names,
+  covars = CHS_covars,
+  protein_names = overlap_proteins
+)
+
+BHRC_PWAS_results <- run_cohort_single_pwas(
+  df = BHRC_pwas_df,
+  cohort = "BHRC",
+  pfas_names = BHRC_pfas_names,
+  covars = BHRC_covars,
+  protein_names = overlap_proteins
+)
+
+PFAS_single_PWAS_results <- dplyr::bind_rows(
+  SOLAR_PWAS_results,
+  CHS_PWAS_results,
+  BHRC_PWAS_results
+)
+
+readr::write_csv(
+  PFAS_single_PWAS_results,
+  fs::path(dir_pwas, "PFAS_single_PWAS_results.csv")
+)
+
+PFAS_single_PWAS_results %>%
+  dplyr::group_by(cohort, pfas_abbrev) %>%
+  dplyr::summarise(
+    n_nominal_p_lt_0.05 = sum(p_value < 0.05, na.rm = TRUE),
+    n_BH_p_lt_0.05 = sum(adjusted_pval_BH < 0.05, na.rm = TRUE),
+    n_BY_p_lt_0.05 = sum(adjusted_pval_BY < 0.05, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(cohort, pfas_abbrev) %>%
+  kableExtra::kbl(caption = "Single-PFAS PWAS significant association counts.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+## PFAS-Mixture PWAS
+
+```{r mixture-pfas-pwas}
+SOLAR_mixture_PWAS_results <- run_cohort_mixture_pwas(
+  df = SOLAR_pwas_df,
+  cohort = "SOLAR",
+  pfas_names = SOLAR_pfas_names,
+  covars = SOLAR_covars,
+  protein_names = overlap_proteins
+)
+
+CHS_mixture_PWAS_results <- run_cohort_mixture_pwas(
+  df = CHS_pwas_df,
+  cohort = "CHS",
+  pfas_names = CHS_pfas_names,
+  covars = CHS_covars,
+  protein_names = overlap_proteins
+)
+
+BHRC_mixture_PWAS_results <- run_cohort_mixture_pwas(
+  df = BHRC_pwas_df,
+  cohort = "BHRC",
+  pfas_names = BHRC_pfas_names,
+  covars = BHRC_covars,
+  protein_names = overlap_proteins
+)
+
+PFAS_mixture_PWAS_results <- dplyr::bind_rows(
+  SOLAR_mixture_PWAS_results,
+  CHS_mixture_PWAS_results,
+  BHRC_mixture_PWAS_results
+)
+
+readr::write_csv(
+  PFAS_mixture_PWAS_results,
+  fs::path(dir_pwas, "PFAS_mixture_qgcomp_PWAS_results.csv")
+)
+
+PFAS_mixture_PWAS_results %>%
+  dplyr::group_by(cohort, mixture) %>%
+  dplyr::summarise(
+    n_nominal_p_lt_0.05 = sum(p_value < 0.05, na.rm = TRUE),
+    n_BH_p_lt_0.05 = sum(adjusted_pval_BH < 0.05, na.rm = TRUE),
+    n_BY_p_lt_0.05 = sum(adjusted_pval_BY < 0.05, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(cohort) %>%
+  kableExtra::kbl(caption = "PFAS-mixture qgcomp PWAS significant association counts.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```

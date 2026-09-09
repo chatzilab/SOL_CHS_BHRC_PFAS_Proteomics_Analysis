@@ -1,0 +1,1790 @@
+---
+title: "PFAS and Proteomics Praxis-BGM Clustering"
+author: "Zhenjiang Li"
+date: today
+toc: true
+toc_expand: 2
+format:
+  html:
+    code-fold: true
+    html-math-method: katex
+    fontsize: 16pt
+    grid:
+      sidebar-width: 0px
+      body-width: 1500px
+      margin-width: 500px
+      gutter-width: 1.5rem
+embed-resources: true
+editor: visual
+editor_options:
+  chunk_output_type: console
+---
+
+## Environment Setup {.hidden}
+
+```{=html}
+<style type="text/css">
+caption, .table-caption {
+  text-align: left;
+}
+</style>
+```
+
+```{r setup}
+#| echo: false
+
+options(scipen = 999)
+
+library(fs)
+library(here)
+i_am("1_scripts/!analytic_workflow_pfas_praxis_BGM.qmd")
+
+source(here::here("1_scripts", "!libraries.R"))
+source(here::here("1_scripts", "!directories.R"))
+source(here::here("1_scripts", "!functions.R"))
+source(here::here("1_scripts", "0_reactome_pathway_helpers.R"))
+
+library(ggtext)
+
+options(knitr.table.format = "html")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r shorten-long-path}
+#| include: false
+
+create_shortcut <- function(path, short_cut, drive) {
+  return(
+    sub(gsub("\\)", "\\\\)", gsub("\\(", "\\\\(", short_cut)), paste0(drive, ":"), path)
+  )
+}
+
+if (nchar(dir_data) > 80) {
+  system("subst x: /D")
+  short_cut <- dir_home |> dirname()
+  system(paste0("subst x: \"", short_cut, "\""))
+
+  dir_objects_names <- ls(pattern = "^dir_")
+  dir_list <- mget(dir_objects_names)
+
+  dir_list_shortened <- lapply(
+    dir_list,
+    function(y) create_shortcut(y, short_cut, "x")
+  )
+  list2env(dir_list_shortened, envir = .GlobalEnv)
+}
+
+rm(list = intersect(
+  c("dir_objects_names", "short_cut", "dir_list", "dir_list_shortened"),
+  ls()
+))
+```
+
+# Parameters
+
+```{r parameters}
+cohort_names <- c("SOLAR", "CHS", "BHRC")
+
+SOLAR_pfas_names <- c("pfos_log2", "pfoa_log2", "pfna_log2", "pfda_log2", "pfhxs_log2", "pfhps_log2")
+CHS_pfas_names <- c("ma_pfos_log2", "ma_pfoa_log2", "ma_pfna_log2", "ma_pfda_log2", "ma_pfhxs_log2", "ma_pfhps_log2")
+BHRC_pfas_names <- c("PFOS_det60_imputed_log2", "PFOA_det60_imputed_log2", "PFNA_det60_imputed_log2", "PFDA_det60_imputed_log2", "PFHxS_det60_imputed_log2", "PFHpS_det60_imputed_log2")
+PFAS_abbrev_names <- c("PFOS", "PFOA", "PFNA", "PFDA", "PFHxS", "PFHpS")
+
+praxis_k <- 2
+praxis_seed <- 20260716
+praxis_num_iters <- 500
+praxis_beta <- 0.001
+praxis_tol <- 1e-4
+praxis_max_iters <- 300L
+praxis_prior_mus_variance <- 10.0
+praxis_num_samples <- 16
+praxis_data_precision_int <- 1L
+praxis_likelihood_temp <- 1.0
+praxis_rho_prec <- 0.05
+praxis_rho_mu <- 1.0
+praxis_elbo_eval_freq <- 5L
+praxis_batch_size_max <- 64
+praxis_early_stop <- TRUE
+praxis_patience <- 5L
+praxis_covariance_transfer_scale <- 1
+pwas_screening_fdr_cutoff <- 0.20
+marker_bf_threshold <- 1
+pfas_concentration_unit <- "ng/mL"
+
+dir_praxis <- fs::path(dir_temp_data, "Praxis_BGM")
+dir_pwas <- fs::path(dir_temp_data, "PFAS_PWAS")
+fs::dir_create(dir_praxis)
+```
+
+The Praxis-BGM parameters were chosen to match the scientific goal and keep the first-pass analysis computationally stable.
+
+- `praxis_k = 2`: Directly encodes the target of identifying two participant clusters.
+- `praxis_seed = 20260716`: Fixes the random initialization so the same data and settings give reproducible cluster assignments.
+- `praxis_num_iters = 500`: Uses a moderate first-pass training length, long enough for the model to move beyond initialization but short enough for exploratory runs. If cluster assignments are unstable across seeds or diagnostics suggest non-convergence, increase this value.
+- `praxis_beta = 0.001`: Controls the strength of the Praxis-BGM prior/regularization term used by the wrapper. This small value keeps the model weakly regularized rather than forcing clusters too strongly.
+- `praxis_tol = 1e-4`: Sets the convergence tolerance used during model initialization.
+- `praxis_max_iters = 300`: Caps the number of initialization iterations before the main Praxis-BGM optimization loop.
+- `praxis_prior_mus_variance = 10.0`: Sets a diffuse variance for automatically initialized cluster means.
+- `praxis_num_samples = 16`: Sets the Monte Carlo/sample count used by Praxis-BGM during fitting and feature scoring, balancing runtime against posterior stability.
+- `praxis_data_precision_int = 1`: Passes the data precision control used by the Python implementation.
+- `praxis_likelihood_temp = 1.0`: Uses the standard, untempered likelihood contribution.
+- `praxis_rho_prec = 0.05`: Applies conservative damping to precision/covariance updates.
+- `praxis_rho_mu = 1.0`: Applies full mean updates.
+- `praxis_elbo_eval_freq = 5`: Evaluates the ELBO every five iterations for convergence monitoring.
+- `praxis_batch_size_max = 64`: Caps the mini-batch size so fitting is feasible for the cohort sample sizes and local machine memory.
+- `praxis_early_stop = TRUE` and `praxis_patience = 5`: Stop fitting early after five ELBO checks without sufficient improvement.
+- `praxis_covariance_transfer_scale = 1`: Transfers the SOLAR posterior covariance to CHS and BHRC without inflating or shrinking uncertainty. Values above 1 make the transferred prior more diffuse, while values below 1 make it tighter.
+- `pwas_screening_fdr_cutoff = 0.20`: Selects proteins associated with any single PFAS compound or the PFAS mixture at BH-adjusted p \< 0.20 in SOLAR.
+- `marker_bf_threshold = 1`: Displays proteins with Praxis-BGM Bayes-factor importance values at or above 1 in the marker protein abundance plot.
+- `pfas_concentration_unit = "ng/mL"`: Labels the back-transformed PFAS concentrations in the visualization section. Change this if the cohort source data use a different PFAS concentration unit.
+
+# Praxis-BGM Interface
+
+Praxis-BGM is fit from R through the `Praxis_BGM_R_interface` wrapper.
+The wrapper uses `reticulate` and expects the Python package `praxis_bgm` to be installed in the Python environment selected below.
+
+```{r praxis-interface}
+library(reticulate)
+
+praxis_python <- Sys.getenv("RETICULATE_PYTHON", unset = "")
+praxis_python <- Sys.getenv("PRAXIS_PYTHON", unset = praxis_python)
+
+if (!nzchar(praxis_python)) {
+  praxis_python <- "C:/Users/lizhenji/AppData/Local/Python/pythoncore-3.12-64/python.exe"
+}
+
+reticulate::use_python(praxis_python, required = TRUE)
+reticulate::py_config()
+
+praxis_r_interface_path <- Sys.getenv("PRAXIS_BGM_R_INTERFACE", unset = "")
+
+if (nzchar(praxis_r_interface_path) && fs::file_exists(praxis_r_interface_path)) {
+  source(praxis_r_interface_path)
+} else {
+  source("https://raw.githubusercontent.com/BruceResearch/Praxis_BGM_R_interface/main/R/praxis_bgm_interface.R")
+}
+
+if (!reticulate::py_module_available("praxis_bgm")) {
+  stop(
+    "The Python module 'praxis_bgm' is not available. ",
+    "Install it in the selected Python environment, for example: ",
+    "pip install git+https://github.com/ContiLab-usc/Praxis-BGM.git"
+  )
+}
+```
+
+# Data Preparation
+
+This section harmonizes the three cohorts before clustering.
+The goal is to build one participant-level table per cohort with the same six PFAS compounds and the same bridged Olink protein features.
+SOLAR is treated as the reference cohort because its fitted Praxis-BGM posterior is later transferred to CHS and BHRC as prior information.
+
+## Bridged proteomics
+
+The bridged proteomics object contains cohort-specific Olink matrices and protein annotation.
+We keep only proteins observed in all three cohorts so that the SOLAR reference model and the CHS/BHRC transfer models use the same feature space.
+Cohort-specific protein identifiers are then converted to participant IDs used by the PFAS files.
+
+```{r proteomics-data}
+proteomics_l <- readRDS(fs::path(
+  dir_data,
+  "ShARP_BHRC_Shared",
+  "ShARP_BHRC_Data_Shared",
+  "OLINK_proteomics_bridged_BHRC_SOLAR_CHS.rds"
+))
+
+proteomics_metadata_cols <- c("LABID", "study", "Batch")
+
+overlap_proteins <- proteomics_l[cohort_names] %>%
+  purrr::map(~ setdiff(names(.x), proteomics_metadata_cols)) %>%
+  purrr::reduce(intersect)
+
+proteomics_l <- proteomics_l[c(cohort_names, "protein_annotation")]
+
+proteomics_l[cohort_names] <- proteomics_l[cohort_names] %>%
+  purrr::map(~ .x %>% dplyr::select(tidyselect::any_of(proteomics_metadata_cols), tidyselect::all_of(overlap_proteins)))
+
+proteomics_l$protein_annotation <- proteomics_l$protein_annotation[cohort_names] %>%
+  purrr::map(~ .x %>% dplyr::filter(meta_id %in% overlap_proteins))
+
+SOLAR_prote <- proteomics_l$SOLAR %>%
+  dplyr::mutate(id = gsub("-", "_", tolower(LABID))) %>%
+  dplyr::select(id, tidyselect::all_of(overlap_proteins))
+
+CHS_prote <- proteomics_l$CHS %>%
+  dplyr::rename(SampleID = LABID) %>%
+  dplyr::select(SampleID, tidyselect::all_of(overlap_proteins))
+
+BHRC_prote <- proteomics_l$BHRC %>%
+  dplyr::select(LABID, tidyselect::all_of(overlap_proteins))
+
+proteomics_property <- proteomics_l$protein_annotation$SOLAR %>%
+  dplyr::transmute(
+    OlinkID = meta_id,
+    UniProt = meta_Uniprot,
+    Assay = meta_id,
+    Protein = meta_Assay,
+    Panel = NA_character_
+  )
+
+cat("Overlapping proteins across SOLAR, CHS, and BHRC:", length(overlap_proteins), "\n")
+```
+
+## SOLAR
+
+For SOLAR, the first available visit per participant is used.
+PFAS variables are joined to bridged protein abundances through the harmonized participant ID.
+
+```{r solar-data-prep}
+load(fs::path(
+  dir_data,
+  "ShARP_SOLAR_Shared",
+  "ShARP_SOLAR_Data_Shared",
+  "Solar_Analysis_20251003.Rda"
+))
+SOLAR <- analysis_df
+rm(analysis_df)
+
+SOLAR_visit1 <- SOLAR %>%
+  dplyr::group_by(id) %>%
+  dplyr::filter(visit == min(visit)) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(id, tidyselect::all_of(SOLAR_pfas_names))
+
+SOLAR_working_df <- SOLAR_prote %>%
+  dplyr::left_join(SOLAR_visit1, by = "id")
+
+dim(SOLAR_working_df)
+```
+
+## CHS
+
+For CHS, the MetaAir baseline records provide PFAS concentrations.
+The plasma sample inventory links proteomics sample IDs to CHS participant IDs before joining to the analysis data.
+
+```{r chs-data-prep}
+CHS <- readRDS(fs::path(
+  dir_data,
+  "ShARP_CHS_Shared",
+  "ShARP_CHS_Data_Shared",
+  "CHS MetaAir MetaChem Cleaned Redcap and Exposures Outcome Data long V5.rds"
+))
+
+CHS_id_link <- readxl::read_xlsx(
+  fs::path(
+    here::here() |> dirname() |> dirname() |> dirname() |> dirname() |> dirname(),
+    "Chatzi Projects and Analyses",
+    "Env Chem SOL-CHS",
+    "Lab Analysis and sample shipments",
+    "Metachem_sample_inventory_master_040522.xlsx"
+  ),
+  sheet = "Plasma"
+) %>%
+  dplyr::transmute(
+    SampleID = `Plasma Aliquot ID`,
+    id = as.character(`Sample Name`)
+  )
+
+CHS_prote <- CHS_prote %>%
+  dplyr::left_join(CHS_id_link, by = "SampleID") %>%
+  dplyr::select(id, tidyselect::everything(), -SampleID)
+
+CHS_baseline <- CHS %>%
+  dplyr::filter(study == "MetaAir") %>%
+  dplyr::select(id, tidyselect::all_of(CHS_pfas_names))
+
+CHS_working_df <- CHS_prote %>%
+  dplyr::left_join(CHS_baseline, by = "id")
+
+dim(CHS_working_df)
+```
+
+## BHRC
+
+For BHRC, visit 1 is used for PFAS and joined to bridged protein abundances by `LABID`.
+The PFAS variables here use the detection/imputation fields from the three-set PFAS file to match the PWAS screening workflow.
+
+```{r bhrc-data-prep}
+BHRC <- readRDS(
+  fs::path(
+    dir_data,
+    "ShARP_BHRC_Shared",
+    "ShARP_BHRC_Data_Shared",
+    "CCHC_usc250_long_12172025.rds"
+  )
+) %>%
+  dplyr::filter(visit %in% c(1, 2))
+
+BHRC_pfas <- readRDS(
+  fs::path(
+    dir_data,
+    "ShARP_BHRC_Shared",
+    "ShARP_BHRC_Data_Shared",
+    "PFAS_CCHC_three_sets.rds"
+  )
+)
+
+BHRC_analysis_df <- BHRC %>%
+  dplyr::filter(visit == 1) %>%
+  dplyr::select(RRID, LABID, visit) %>%
+  dplyr::left_join(
+    BHRC_pfas %>%
+      dplyr::select(RRID, tidyselect::all_of(BHRC_pfas_names)),
+    by = "RRID"
+  ) %>%
+  dplyr::arrange(LABID, visit) %>%
+  dplyr::distinct(LABID, .keep_all = TRUE)
+
+BHRC_working_df <- BHRC_prote %>%
+  dplyr::left_join(BHRC_analysis_df, by = "LABID")
+
+dim(BHRC_working_df)
+```
+
+# Protein Features
+
+Praxis-BGM is fit using proteins only in this workflow.
+PFAS variables are not included in the model matrix; they are used upstream to screen proteins and downstream to characterize the resulting clusters.
+The protein screen uses the PWAS results generated by `!analytic_workflow_pfas_PWAS.qmd`.
+Proteins are retained if they are associated with any single PFAS compound or the PFAS mixture at BH-adjusted p \< 0.20 in SOLAR.
+
+## PWAS-Based Protein Selection
+
+```{r pwas-protein-selection}
+pwas_single_file <- fs::path(dir_pwas, "PFAS_single_PWAS_results.csv")
+pwas_mixture_file <- fs::path(dir_pwas, "PFAS_mixture_qgcomp_PWAS_results.csv")
+
+if (!fs::file_exists(pwas_single_file) || !fs::file_exists(pwas_mixture_file)) {
+  stop(
+    "PWAS screening files were not found. Run 1_scripts/!analytic_workflow_pfas_PWAS.qmd first."
+  )
+}
+
+PFAS_single_PWAS_results <- readr::read_csv(pwas_single_file, show_col_types = FALSE) %>%
+  dplyr::filter(cohort == "SOLAR")
+
+PFAS_mixture_PWAS_results <- readr::read_csv(pwas_mixture_file, show_col_types = FALSE) %>%
+  dplyr::filter(cohort == "SOLAR")
+
+selected_single_pwas_proteins <- PFAS_single_PWAS_results %>%
+  dplyr::filter(!is.na(adjusted_pval_BH), adjusted_pval_BH < pwas_screening_fdr_cutoff) %>%
+  dplyr::pull(feature_name)
+
+selected_mixture_pwas_proteins <- PFAS_mixture_PWAS_results %>%
+  dplyr::filter(!is.na(adjusted_pval_BH), adjusted_pval_BH < pwas_screening_fdr_cutoff) %>%
+  dplyr::pull(feature_name)
+
+selected_proteins <- union(selected_single_pwas_proteins, selected_mixture_pwas_proteins) %>%
+  intersect(overlap_proteins) %>%
+  sort()
+
+if (length(selected_proteins) == 0) {
+  stop("No proteins passed the BH-adjusted PWAS/qgcomp screening threshold.")
+}
+
+tibble::tibble(
+  n_overlap_proteins = length(overlap_proteins),
+  n_single_PFAS_selected = length(intersect(unique(selected_single_pwas_proteins), overlap_proteins)),
+  n_mixture_selected = length(intersect(unique(selected_mixture_pwas_proteins), overlap_proteins)),
+  n_proteins_used_in_praxis = length(selected_proteins),
+  protein_filtering = paste0(
+    "SOLAR single PFAS or PFAS mixture association with BH-adjusted p < ",
+    pwas_screening_fdr_cutoff
+  )
+) %>%
+  kableExtra::kbl(caption = "Praxis-BGM protein feature summary.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+
+PFAS_single_PWAS_results %>%
+  dplyr::filter(!is.na(adjusted_pval_BH), adjusted_pval_BH < pwas_screening_fdr_cutoff) %>%
+  dplyr::count(cohort, pfas_abbrev, name = "n_selected") %>%
+  dplyr::arrange(cohort, pfas_abbrev) %>%
+  dplyr::rename(
+    `Cohort` = cohort,
+    `PFAS` = pfas_abbrev,
+    `Proteins selected` = n_selected
+  ) %>%
+  kableExtra::kbl(caption = "Proteins selected by SOLAR single-PFAS PWAS at BH-adjusted p < 0.20.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+
+pwas_selected_protein_table <- dplyr::bind_rows(
+  PFAS_single_PWAS_results %>%
+    dplyr::filter(!is.na(adjusted_pval_BH), adjusted_pval_BH < pwas_screening_fdr_cutoff) %>%
+    dplyr::transmute(
+      analysis = "Single-PFAS PWAS",
+      exposure = pfas_abbrev,
+      feature_name,
+      Protein,
+      UniProt,
+      estimate = estimate_beta,
+      standard_error = se_beta,
+      ci_low = ci_beta_low,
+      ci_high = ci_beta_high,
+      test_statistic,
+      p_value,
+      adjusted_pval_BH,
+      adjusted_pval_BY
+    ),
+  PFAS_mixture_PWAS_results %>%
+    dplyr::filter(!is.na(adjusted_pval_BH), adjusted_pval_BH < pwas_screening_fdr_cutoff) %>%
+    dplyr::transmute(
+      analysis = "PFAS-mixture qgcomp",
+      exposure = "PFAS mixture",
+      feature_name,
+      Protein,
+      UniProt,
+      estimate = estimate_beta,
+      standard_error = NA_real_,
+      ci_low = ci_beta_low,
+      ci_high = ci_beta_high,
+      test_statistic,
+      p_value,
+      adjusted_pval_BH,
+      adjusted_pval_BY
+    )
+) %>%
+  dplyr::filter(feature_name %in% selected_proteins) %>%
+  dplyr::arrange(adjusted_pval_BH, p_value, Protein, exposure)
+
+pwas_selected_protein_table %>%
+  dplyr::transmute(
+    `Selection analysis` = analysis,
+    `Associated exposure` = exposure,
+    `Olink assay` = feature_name,
+    `Protein name` = Protein,
+    `UniProt ID` = UniProt,
+    `Effect estimate` = round(estimate, 3),
+    `Standard error` = round(standard_error, 3),
+    `95% CI` = dplyr::if_else(
+      !is.na(ci_low) & !is.na(ci_high),
+      paste0("[", round(ci_low, 3), ", ", round(ci_high, 3), "]"),
+      NA_character_
+    ),
+    `Test statistic` = round(test_statistic, 3),
+    `P-value` = scales::pvalue(p_value, accuracy = 0.001),
+    `BH-adjusted p-value` = scales::pvalue(adjusted_pval_BH, accuracy = 0.001),
+    `BY-adjusted p-value` = scales::pvalue(adjusted_pval_BY, accuracy = 0.001)
+  ) %>%
+  kableExtra::kbl(
+    caption = "Supplemental Table. SOLAR PWAS associations used to select proteins for Praxis-BGM.",
+    align = c("l", "l", "l", "l", "l", rep("r", 7))
+  ) %>%
+  kableExtra::kable_paper("hover", full_width = FALSE) %>%
+  kableExtra::footnote(
+    general = paste(
+      "Proteins were selected for Praxis-BGM if they were associated with any single PFAS compound or the PFAS mixture in SOLAR at BH-adjusted p < 0.20.",
+      "Effect estimates and 95% confidence intervals are from the SOLAR PWAS screening models.",
+      "For single-PFAS PWAS, the effect estimate is the beta coefficient for the listed PFAS exposure.",
+      "For PFAS-mixture qgcomp, the effect estimate is the mixture effect estimate.",
+      "BH, Benjamini-Hochberg; BY, Benjamini-Yekutieli; CI, confidence interval."
+    ),
+    general_title = "Note: ",
+    footnote_as_chunk = TRUE
+  )
+```
+
+# Praxis-BGM Data Matrices
+
+The Praxis-BGM input matrix contains only the selected proteins.
+PFAS variables are kept in the cohort data for post hoc cluster visualization, but they are not passed to Praxis-BGM.
+Protein abundances are already log2-transformed upstream.
+The scaling step below does not log-transform again; it z-scores each protein feature using the SOLAR reference mean and SD.
+CHS and BHRC are then placed on the same SOLAR reference scale before transfer modeling.
+
+## Matrix construction helpers
+
+```{r praxis-data-helpers}
+rename_pfas_to_common_names <- function(df, pfas_names, common_names = PFAS_abbrev_names) {
+  out <- df
+  names(out)[match(pfas_names, names(out))] <- common_names
+  out
+}
+
+make_praxis_df <- function(df, id_col, pfas_names, protein_names) {
+  df %>%
+    dplyr::select(
+      tidyselect::all_of(id_col),
+      tidyselect::all_of(pfas_names),
+      tidyselect::all_of(protein_names)
+    ) %>%
+    dplyr::rename(participant_id = tidyselect::all_of(id_col)) %>%
+    rename_pfas_to_common_names(pfas_names) %>%
+    dplyr::filter(
+      stats::complete.cases(dplyr::select(., tidyselect::all_of(protein_names)))
+    )
+}
+
+make_scaled_matrix <- function(df, feature_names, center = NULL, scale = NULL) {
+  X <- as.matrix(df[, feature_names, drop = FALSE])
+  storage.mode(X) <- "double"
+
+  if (is.null(center)) {
+    center <- colMeans(X, na.rm = TRUE)
+  }
+  if (is.null(scale)) {
+    scale <- apply(X, 2, stats::sd, na.rm = TRUE)
+  }
+
+  scale[is.na(scale) | scale == 0] <- 1
+
+  list(
+    X = sweep(sweep(X, 2, center, "-"), 2, scale, "/"),
+    center = center,
+    scale = scale
+  )
+}
+```
+
+## Complete-case model matrices
+
+```{r praxis-data}
+praxis_feature_names <- selected_proteins
+
+SOLAR_praxis_df <- make_praxis_df(
+  df = SOLAR_working_df,
+  id_col = "id",
+  pfas_names = SOLAR_pfas_names,
+  protein_names = selected_proteins
+)
+
+CHS_praxis_df <- make_praxis_df(
+  df = CHS_working_df,
+  id_col = "id",
+  pfas_names = CHS_pfas_names,
+  protein_names = selected_proteins
+)
+
+BHRC_praxis_df <- make_praxis_df(
+  df = BHRC_working_df,
+  id_col = "LABID",
+  pfas_names = BHRC_pfas_names,
+  protein_names = selected_proteins
+)
+
+SOLAR_scaled <- make_scaled_matrix(SOLAR_praxis_df, praxis_feature_names)
+CHS_scaled <- make_scaled_matrix(
+  CHS_praxis_df,
+  praxis_feature_names,
+  center = SOLAR_scaled$center,
+  scale = SOLAR_scaled$scale
+)
+BHRC_scaled <- make_scaled_matrix(
+  BHRC_praxis_df,
+  praxis_feature_names,
+  center = SOLAR_scaled$center,
+  scale = SOLAR_scaled$scale
+)
+
+tibble::tibble(
+  cohort = cohort_names,
+  n_participants = c(nrow(SOLAR_scaled$X), nrow(CHS_scaled$X), nrow(BHRC_scaled$X)),
+  n_pfas_in_model = 0L,
+  n_proteins = length(selected_proteins),
+  n_total_features = length(praxis_feature_names)
+) %>%
+  kableExtra::kbl(caption = "Praxis-BGM complete-case modeling matrices.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+## Input feature inventory
+
+```{r praxis-input-features}
+praxis_input_features <- tibble::tibble(
+  feature_name = praxis_feature_names,
+  feature_type = "Protein"
+) %>%
+  dplyr::left_join(proteomics_property, by = c("feature_name" = "Assay")) %>%
+  dplyr::mutate(
+    input_source = "PWAS/qgcomp-screened protein"
+  )
+
+praxis_input_features %>%
+  dplyr::count(feature_type, input_source, name = "n_features") %>%
+  kableExtra::kbl(caption = "Features passed into Praxis-BGM.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+
+praxis_input_features %>%
+  dplyr::filter(feature_type == "Protein") %>%
+  dplyr::select(feature_name, Protein, UniProt, input_source) %>%
+  dplyr::slice_head(n = 20) %>%
+  kableExtra::kbl(caption = "First 20 proteins passed into Praxis-BGM.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+# SOLAR Prior Model
+
+The SOLAR model is the reference Praxis-BGM fit.
+It learns two clusters from the SOLAR selected-protein matrix and produces posterior cluster parameters.
+These posterior means, covariances, and weights are saved as priors for CHS and BHRC.
+
+## Fit SOLAR reference clusters
+
+```{r fit-solar-praxis}
+set.seed(praxis_seed)
+
+SOLAR_praxis_fit <- praxis_bgm_fit(
+  data = SOLAR_scaled$X,
+  K = praxis_k,
+  seed = praxis_seed,
+  beta = praxis_beta,
+  tol = praxis_tol,
+  max_iters = praxis_max_iters,
+  prior_mus_variance = praxis_prior_mus_variance,
+  num_samples = praxis_num_samples,
+  data_precision_int = praxis_data_precision_int,
+  likelihood_temp = praxis_likelihood_temp,
+  rho_prec = praxis_rho_prec,
+  rho_mu = praxis_rho_mu,
+  elbo_eval_freq = praxis_elbo_eval_freq,
+  num_iters = praxis_num_iters,
+  batch_size = min(praxis_batch_size_max, nrow(SOLAR_scaled$X)),
+  early_stop = praxis_early_stop,
+  patience = praxis_patience,
+  verbose = TRUE
+)
+
+SOLAR_cluster_assignments <- tibble::tibble(
+  cohort = "SOLAR",
+  participant_id = SOLAR_praxis_df$participant_id,
+  praxis_cluster = paste0("C", SOLAR_praxis_fit$assignments),
+  praxis_cluster_numeric = SOLAR_praxis_fit$assignments
+)
+
+SOLAR_priors <- list(
+  prior_mus = SOLAR_praxis_fit$posterior_mus,
+  prior_Sigmas = SOLAR_praxis_fit$posterior_covs * praxis_covariance_transfer_scale,
+  prior_weights = SOLAR_praxis_fit$learned_weights
+)
+
+saveRDS(
+  list(
+    fit = SOLAR_praxis_fit,
+    priors = SOLAR_priors,
+    feature_names = praxis_feature_names,
+    scaling = list(center = SOLAR_scaled$center, scale = SOLAR_scaled$scale),
+    selected_proteins = selected_proteins
+  ),
+  fs::path(dir_praxis, "SOLAR_praxis_BGM_reference_model.rds")
+)
+
+SOLAR_cluster_assignments %>%
+  dplyr::count(praxis_cluster, name = "n") %>%
+  dplyr::mutate(pct = n / sum(n)) %>%
+  kableExtra::kbl(caption = "SOLAR Praxis-BGM reference cluster sizes.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+# CHS and BHRC Transfer Models
+
+The CHS and BHRC models are fit in the same standardized feature space as SOLAR.
+The SOLAR posterior means, covariances, and mixture weights are supplied as prior and initialization values.
+This makes the target-cohort clusters interpretable relative to the SOLAR reference clusters rather than as completely separate unsupervised solutions.
+
+## Transfer-model helper
+
+```{r transfer-model-helper}
+fit_transfer_praxis <- function(X, target_df, cohort, seed_offset) {
+  fit <- praxis_bgm_fit(
+    data = X,
+    K = praxis_k,
+    seed = praxis_seed + seed_offset,
+    prior_mus = SOLAR_priors$prior_mus,
+    prior_Sigmas = SOLAR_priors$prior_Sigmas,
+    prior_weights = SOLAR_priors$prior_weights,
+    init_mus = SOLAR_priors$prior_mus,
+    init_covs = SOLAR_priors$prior_Sigmas,
+    init_pis = SOLAR_priors$prior_weights,
+    beta = praxis_beta,
+    tol = praxis_tol,
+    max_iters = praxis_max_iters,
+    prior_mus_variance = praxis_prior_mus_variance,
+    num_samples = praxis_num_samples,
+    data_precision_int = praxis_data_precision_int,
+    likelihood_temp = praxis_likelihood_temp,
+    rho_prec = praxis_rho_prec,
+    rho_mu = praxis_rho_mu,
+    elbo_eval_freq = praxis_elbo_eval_freq,
+    num_iters = praxis_num_iters,
+    batch_size = min(praxis_batch_size_max, nrow(X)),
+    early_stop = praxis_early_stop,
+    patience = praxis_patience,
+    verbose = TRUE
+  )
+
+  assignments <- tibble::tibble(
+    cohort = cohort,
+    participant_id = target_df$participant_id,
+    praxis_cluster = paste0("C", fit$assignments),
+    praxis_cluster_numeric = fit$assignments
+  )
+
+  list(fit = fit, assignments = assignments)
+}
+```
+
+## Fit CHS and BHRC transfer clusters
+
+```{r fit-transfer-praxis}
+CHS_praxis_transfer <- fit_transfer_praxis(
+  X = CHS_scaled$X,
+  target_df = CHS_praxis_df,
+  cohort = "CHS",
+  seed_offset = 1
+)
+
+BHRC_praxis_transfer <- fit_transfer_praxis(
+  X = BHRC_scaled$X,
+  target_df = BHRC_praxis_df,
+  cohort = "BHRC",
+  seed_offset = 2
+)
+
+praxis_cluster_assignments <- dplyr::bind_rows(
+  SOLAR_cluster_assignments,
+  CHS_praxis_transfer$assignments,
+  BHRC_praxis_transfer$assignments
+)
+
+readr::write_csv(
+  praxis_cluster_assignments,
+  fs::path(dir_praxis, "Praxis_BGM_SOLAR_prior_cluster_assignments.csv")
+)
+
+saveRDS(
+  list(
+    CHS = CHS_praxis_transfer,
+    BHRC = BHRC_praxis_transfer,
+    feature_names = praxis_feature_names,
+    SOLAR_priors = SOLAR_priors,
+    scaling = list(center = SOLAR_scaled$center, scale = SOLAR_scaled$scale)
+  ),
+  fs::path(dir_praxis, "CHS_BHRC_praxis_BGM_transfer_models.rds")
+)
+
+praxis_cluster_assignments %>%
+  dplyr::count(cohort, praxis_cluster, name = "n") %>%
+  dplyr::group_by(cohort) %>%
+  dplyr::mutate(pct = n / sum(n)) %>%
+  dplyr::ungroup() %>%
+  kableExtra::kbl(caption = "Praxis-BGM cluster sizes by cohort.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+# Feature Contributions
+
+Praxis-BGM provides a Bayes-factor-based feature selection helper through the R wrapper.
+This is the model-specific feature importance output: features ranked here are the selected proteins that the fitted mixture model considers most useful for separating clusters.
+Because wrapper outputs can vary by package version, the table below records the feature ranking and any available Bayes-factor/statistic fields returned by the helper.
+
+## Bayes-factor feature ranking
+
+```{r bayes-factor-selection}
+SOLAR_bf <- praxis_bgm_bf_selection(
+  model = SOLAR_praxis_fit,
+  data = SOLAR_scaled$X,
+  top_n = length(praxis_feature_names),
+  visual = FALSE
+)
+
+CHS_bf <- praxis_bgm_bf_selection(
+  model = CHS_praxis_transfer$fit,
+  data = CHS_scaled$X,
+  top_n = length(praxis_feature_names),
+  visual = FALSE
+)
+
+BHRC_bf <- praxis_bgm_bf_selection(
+  model = BHRC_praxis_transfer$fit,
+  data = BHRC_scaled$X,
+  top_n = length(praxis_feature_names),
+  visual = FALSE
+)
+
+make_bf_table <- function(bf, cohort) {
+  out <- tibble::tibble(
+    cohort = cohort,
+    feature_index = bf$top_features,
+    feature_name = praxis_feature_names[bf$top_features],
+    importance_value = NA_real_
+  ) %>%
+    dplyr::mutate(
+      feature_type = "Protein"
+    )
+
+  candidate_value_names <- c("bayes_factors", "bf_values", "BF", "scores", "feature_scores")
+  value_name <- intersect(candidate_value_names, names(bf))[1]
+
+  if (!is.na(value_name)) {
+    values <- bf[[value_name]]
+    if (length(values) == length(praxis_feature_names)) {
+      out <- out %>%
+        dplyr::mutate(importance_value = as.numeric(values[feature_index]))
+    } else if (length(values) == length(bf$top_features)) {
+      out <- out %>%
+        dplyr::mutate(importance_value = as.numeric(values))
+    }
+  }
+
+  out %>%
+    dplyr::mutate(importance_rank = dplyr::row_number()) %>%
+    dplyr::left_join(proteomics_property, by = c("feature_name" = "Assay"))
+}
+
+praxis_bf_top_features <- dplyr::bind_rows(
+  make_bf_table(SOLAR_bf, "SOLAR"),
+  make_bf_table(CHS_bf, "CHS"),
+  make_bf_table(BHRC_bf, "BHRC")
+)
+
+readr::write_csv(
+  praxis_bf_top_features,
+  fs::path(dir_praxis, "Praxis_BGM_bayes_factor_top_features.csv")
+)
+
+praxis_bf_top_features %>%
+  dplyr::select(cohort, importance_rank, tidyselect::any_of("importance_value"), feature_index, feature_type, feature_name, Protein, UniProt) %>%
+  kableExtra::kbl(caption = "Top Praxis-BGM Bayes-factor features by cohort.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+# Cluster Summaries
+
+Cluster summaries describe how selected protein features differ between the two participant clusters in each cohort.
+The protein table keeps the original log2 scale for interpretability.
+The PFAS concentration plot is a post hoc characterization analysis: it exponentiates the log2 PFAS values back to the original concentration scale, but PFAS compounds were not used to fit Praxis-BGM.
+Protein ranking visualizations use the Praxis-BGM Bayes-factor feature importance output, so the displayed ranks reflect model-based feature contribution rather than post hoc abundance contrasts.
+
+The visualization strategy focuses on UMAP projections of protein expression, PFAS concentration profiles by cluster, Bayes-factor marker protein plots, and a rank-flow plot that shows which proteins repeatedly receive high model-based importance across cohorts.
+
+## Summary helper
+
+```{r cluster-summary-helper}
+summarise_cluster_features <- function(df, assignments, feature_names, cohort) {
+  df %>%
+    dplyr::select(participant_id, tidyselect::all_of(feature_names)) %>%
+    dplyr::left_join(assignments, by = "participant_id") %>%
+    tidyr::pivot_longer(
+      cols = tidyselect::all_of(feature_names),
+      names_to = "feature_name",
+      values_to = "value"
+    ) %>%
+    dplyr::group_by(cohort, praxis_cluster, feature_name) %>%
+    dplyr::summarise(
+      n = sum(!is.na(value)),
+      mean = mean(value, na.rm = TRUE),
+      sd = stats::sd(value, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(feature_type = "Protein")
+}
+```
+
+## Combined plotting data
+
+```{r plot-data}
+make_feature_df <- function(df, assignments, cohort) {
+  df %>%
+    dplyr::select(participant_id, tidyselect::all_of(praxis_feature_names)) %>%
+    dplyr::left_join(assignments, by = "participant_id") %>%
+    dplyr::mutate(cohort = cohort)
+}
+
+praxis_feature_df <- dplyr::bind_rows(
+  make_feature_df(SOLAR_praxis_df, SOLAR_cluster_assignments, "SOLAR"),
+  make_feature_df(CHS_praxis_df, CHS_praxis_transfer$assignments, "CHS"),
+  make_feature_df(BHRC_praxis_df, BHRC_praxis_transfer$assignments, "BHRC")
+)
+
+make_pfas_df <- function(df, assignments, cohort) {
+  df %>%
+    dplyr::select(participant_id, tidyselect::all_of(PFAS_abbrev_names)) %>%
+    dplyr::left_join(assignments, by = "participant_id") %>%
+    dplyr::mutate(cohort = cohort)
+}
+
+praxis_pfas_df <- dplyr::bind_rows(
+  make_pfas_df(SOLAR_praxis_df, SOLAR_cluster_assignments, "SOLAR"),
+  make_pfas_df(CHS_praxis_df, CHS_praxis_transfer$assignments, "CHS"),
+  make_pfas_df(BHRC_praxis_df, BHRC_praxis_transfer$assignments, "BHRC")
+)
+```
+
+## Protein Cluster Summary Table
+
+```{r cluster-summaries}
+praxis_cluster_feature_summary <- dplyr::bind_rows(
+  summarise_cluster_features(SOLAR_praxis_df, SOLAR_cluster_assignments, praxis_feature_names, "SOLAR"),
+  summarise_cluster_features(CHS_praxis_df, CHS_praxis_transfer$assignments, praxis_feature_names, "CHS"),
+  summarise_cluster_features(BHRC_praxis_df, BHRC_praxis_transfer$assignments, praxis_feature_names, "BHRC")
+)
+
+praxis_cluster_feature_summary %>%
+  dplyr::filter(feature_type == "Protein") %>%
+  dplyr::select(cohort, praxis_cluster, feature_name, n, mean, sd) %>%
+  dplyr::slice_head(n = 20) %>%
+  kableExtra::kbl(caption = "First 20 selected-protein summaries by Praxis-BGM cluster.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+## Plot helper
+
+```{r plot-helper}
+praxis_cluster_colors <- c(
+  C1 = "#E69F00",
+  C2 = "#009E73"
+)
+
+praxis_plot_theme <- function(...) {
+  theme_args <- utils::modifyList(
+    list(
+      plot.title = ggplot2::element_text(size = 10),
+      axis.title = ggplot2::element_text(size = 10),
+      axis.text = ggplot2::element_text(size = 9),
+      axis.text.y = ggplot2::element_text(size = 8),
+      strip.text = ggplot2::element_text(size = 9),
+      legend.title = ggplot2::element_text(size = 9),
+      legend.text = ggplot2::element_text(size = 9),
+      legend.position = "bottom",
+      panel.grid.minor = ggplot2::element_blank()
+    ),
+    list(...)
+  )
+
+  ggplot2::theme_bw(base_size = 9) +
+    do.call(ggplot2::theme, theme_args)
+}
+```
+
+## Cluster size distribution
+
+```{r cluster-size-plot, fig.width=8, fig.height=4}
+praxis_cluster_assignments %>%
+  dplyr::count(cohort, praxis_cluster, name = "n") %>%
+  dplyr::group_by(cohort) %>%
+  dplyr::mutate(pct = n / sum(n)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    cohort = factor(cohort, levels = c("SOLAR", "CHS", "BHRC")),
+    praxis_cluster = factor(praxis_cluster, levels = names(praxis_cluster_colors))
+  ) %>%
+  ggplot2::ggplot(ggplot2::aes(x = cohort, y = pct, fill = praxis_cluster)) +
+  ggplot2::geom_col(width = 0.65, color = "white") +
+  ggplot2::geom_text(
+    ggplot2::aes(label = scales::percent(pct, accuracy = 1)),
+    position = ggplot2::position_stack(vjust = 0.5),
+    color = "white",
+    size = 3.1
+  ) +
+  ggplot2::scale_fill_manual(values = praxis_cluster_colors) +
+  ggplot2::scale_y_continuous(labels = scales::percent_format()) +
+  ggplot2::labs(
+    x = NULL,
+    y = "Participants",
+    fill = "Praxis-BGM cluster"
+  ) +
+  praxis_plot_theme(
+    legend.box.spacing = grid::unit(0, "pt"),
+    legend.margin = ggplot2::margin(0, 0, 0, 0),
+    legend.spacing.y = grid::unit(0, "pt"),
+    legend.key.height = grid::unit(8, "pt"),
+    plot.margin = ggplot2::margin(5.5, 5.5, 0, 5.5)
+  )
+```
+
+```{r}
+#| eval: false
+
+ggsave(
+  filename = fs::path(
+    dir_figures,
+    "praxis_BGM_cluster_distribution.png"
+  ),
+  width = 3, height = 2.5, dpi = 300, units = "in"
+)
+```
+
+## Protein UMAP
+
+```{r protein-umap, fig.width=10, fig.height=7}
+protein_umap_available <- requireNamespace("uwot", quietly = TRUE) || requireNamespace("umap", quietly = TRUE)
+
+if (!protein_umap_available) {
+  message("Skipping UMAP because neither the 'uwot' nor 'umap' package is installed.")
+} else {
+  pooled_protein_matrix <- rbind(
+    SOLAR_scaled$X[, selected_proteins, drop = FALSE],
+    CHS_scaled$X[, selected_proteins, drop = FALSE],
+    BHRC_scaled$X[, selected_proteins, drop = FALSE]
+  )
+
+  pooled_protein_meta <- dplyr::bind_rows(
+    SOLAR_cluster_assignments,
+    CHS_praxis_transfer$assignments,
+    BHRC_praxis_transfer$assignments
+  )
+
+  set.seed(praxis_seed)
+
+  if (requireNamespace("uwot", quietly = TRUE)) {
+    pooled_umap <- uwot::umap(
+      pooled_protein_matrix,
+      n_neighbors = min(15, nrow(pooled_protein_matrix) - 1),
+      min_dist = 0.1,
+      metric = "euclidean",
+      ret_model = FALSE,
+      verbose = FALSE
+    )
+  } else {
+    pooled_umap <- umap::umap(pooled_protein_matrix)$layout
+  }
+
+  praxis_umap_df <- tibble::tibble(
+    UMAP1 = pooled_umap[, 1],
+    UMAP2 = pooled_umap[, 2]
+  ) %>%
+    dplyr::bind_cols(pooled_protein_meta) %>%
+    dplyr::mutate(
+      cohort = factor(cohort, levels = c("SOLAR", "CHS", "BHRC")),
+      praxis_cluster = factor(praxis_cluster, levels = names(praxis_cluster_colors))
+    )
+
+  praxis_umap_df %>%
+    ggplot2::ggplot(ggplot2::aes(x = UMAP1, y = UMAP2, color = praxis_cluster, shape = cohort)) +
+    ggplot2::geom_point(alpha = 0.8, size = 1, stroke = 0.8) +
+    ggplot2::scale_color_manual(values = praxis_cluster_colors) +
+    ggplot2::scale_shape_manual(values = c(SOLAR = 16, CHS = 17, BHRC = 4)) +
+    ggplot2::labs(
+      x = "UMAP 1",
+      y = "UMAP 2",
+      color = "Praxis-BGM cluster",
+      shape = "Cohort"
+    ) +
+    ggplot2::guides(
+      color = ggplot2::guide_legend(nrow = 1, order = 1),
+      shape = ggplot2::guide_legend(nrow = 1, order = 2)
+    ) +
+    praxis_plot_theme(
+      legend.box = "vertical",
+      legend.box.spacing = grid::unit(1, "pt"),
+      legend.spacing.y = grid::unit(1, "pt"),
+      legend.margin = ggplot2::margin(0, 0, 0, 0),
+      legend.key.height = grid::unit(8, "pt")
+    )
+}
+```
+
+```{r}
+#| eval: false
+
+ggsave(
+  filename = fs::path(
+    dir_figures,
+    "praxis_BGM_UMAP.png"
+  ),
+  width = 3, height = 2.5, dpi = 300, units = "in"
+)
+```
+
+## PFAS concentration profiles
+
+```{r cluster-pfas-plot, fig.width=10, fig.height=6}
+pfas_cluster_values <- praxis_pfas_df %>%
+  dplyr::select(cohort, participant_id, praxis_cluster, tidyselect::all_of(PFAS_abbrev_names)) %>%
+  tidyr::pivot_longer(
+    cols = tidyselect::all_of(PFAS_abbrev_names),
+    names_to = "feature_name",
+    values_to = "log2_value"
+  ) %>%
+  dplyr::mutate(
+    concentration = 2^log2_value,
+    cohort = factor(cohort, levels = c("SOLAR", "CHS", "BHRC")),
+    praxis_cluster = factor(praxis_cluster, levels = c("C1", "C2")),
+    feature_name = factor(feature_name, levels = PFAS_abbrev_names)
+  )
+
+pfas_cluster_summary <- pfas_cluster_values %>%
+  dplyr::group_by(cohort, feature_name, praxis_cluster) %>%
+  dplyr::summarise(
+    mean_concentration = mean(concentration, na.rm = TRUE),
+    se_concentration = stats::sd(concentration, na.rm = TRUE) / sqrt(sum(!is.na(concentration))),
+    .groups = "drop"
+  )
+
+pfas_cluster_tests <- pfas_cluster_values %>%
+  dplyr::filter(!is.na(concentration), !is.na(praxis_cluster)) %>%
+  dplyr::group_by(cohort, feature_name) %>%
+  dplyr::group_modify(function(.x, .y) {
+    p_value <- if (dplyr::n_distinct(.x$praxis_cluster) == 2 && all(table(.x$praxis_cluster) >= 2)) {
+      tryCatch(
+        stats::t.test(concentration ~ praxis_cluster, data = .x)$p.value,
+        error = function(e) NA_real_
+      )
+    } else {
+      NA_real_
+    }
+
+    tibble::tibble(p_value = p_value)
+  }) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(cohort) %>%
+  dplyr::mutate(p_adjust_BH = stats::p.adjust(p_value, method = "BH")) %>%
+  dplyr::ungroup()
+
+pfas_cluster_annotation <- pfas_cluster_summary %>%
+  dplyr::group_by(cohort, feature_name) %>%
+  dplyr::slice_max(mean_concentration, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::left_join(pfas_cluster_tests, by = c("cohort", "feature_name")) %>%
+  dplyr::filter(!is.na(p_value), p_value < 0.05) %>%
+  dplyr::mutate(label_y = mean_concentration + se_concentration)
+
+pfas_cluster_summary %>%
+  ggplot2::ggplot(ggplot2::aes(x = feature_name, y = mean_concentration)) +
+  ggplot2::geom_col(
+    ggplot2::aes(fill = praxis_cluster),
+    position = ggplot2::position_dodge(width = 0.72),
+    width = 0.62
+  ) +
+  ggplot2::geom_errorbar(
+    ggplot2::aes(
+      ymin = pmax(mean_concentration - se_concentration, 0),
+      ymax = mean_concentration + se_concentration,
+      color = praxis_cluster
+    ),
+    position = ggplot2::position_dodge(width = 0.72),
+    width = 0.18,
+    linewidth = 0.35
+  ) +
+  ggplot2::geom_text(
+    data = pfas_cluster_annotation,
+    ggplot2::aes(x = feature_name, y = label_y, label = "*", group = praxis_cluster),
+    inherit.aes = FALSE,
+    position = ggplot2::position_dodge(width = 0.72),
+    vjust = -0.2,
+    size = 3.1
+  ) +
+  ggplot2::facet_grid(. ~ cohort) +
+  ggplot2::scale_fill_manual(values = praxis_cluster_colors) +
+  ggplot2::scale_color_manual(values = praxis_cluster_colors) +
+  ggplot2::scale_y_sqrt(
+    labels = scales::label_number(accuracy = 0.01),
+    expand = ggplot2::expansion(mult = c(0, 0.12))
+  ) +
+  ggplot2::labs(
+    x = NULL,
+    y = paste0("PFAS concentration (", pfas_concentration_unit, ")\nsquare-root scale"),
+    fill = "Praxis-BGM cluster",
+    color = "Praxis-BGM cluster"
+  ) +
+  ggplot2::guides(color = "none") +
+  praxis_plot_theme(
+    legend.box.spacing = grid::unit(1, "pt"),
+    legend.margin = ggplot2::margin(0, 0, 0, 0),
+    legend.spacing.x = grid::unit(2, "pt"),
+    legend.spacing.y = grid::unit(1, "pt"),
+    legend.key.height = grid::unit(8, "pt"),
+    axis.text.x = ggplot2::element_text(size = 9, angle = 90, vjust = 0.5, hjust = 1)
+  )
+```
+
+```{r}
+#| eval: false
+
+ggsave(
+  filename = fs::path(
+    dir_figures,
+    "praxis_BGM_pfas_profiles.png"
+  ),
+  width = 4, height = 2.5, units = "in"
+)
+```
+
+## Protein Bayes-factor ranks
+
+```{r cluster-contrast-importance}
+calculate_cluster_contrasts <- function(df, assignments, cohort) {
+  feature_df <- df %>%
+    dplyr::select(participant_id, tidyselect::all_of(praxis_feature_names)) %>%
+    dplyr::left_join(assignments, by = "participant_id") %>%
+    dplyr::filter(!is.na(praxis_cluster))
+
+  cluster_levels <- sort(unique(feature_df$praxis_cluster))
+
+  if (length(cluster_levels) != 2) {
+    return(tibble::tibble())
+  }
+
+  means <- feature_df %>%
+    dplyr::group_by(praxis_cluster) %>%
+    dplyr::summarise(dplyr::across(tidyselect::all_of(praxis_feature_names), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+    tidyr::pivot_longer(
+      cols = tidyselect::all_of(praxis_feature_names),
+      names_to = "feature_name",
+      values_to = "mean_value"
+    )
+
+  means %>%
+    tidyr::pivot_wider(names_from = praxis_cluster, values_from = mean_value) %>%
+    dplyr::mutate(
+      cohort = cohort,
+      contrast = .data[[cluster_levels[2]]] - .data[[cluster_levels[1]]],
+      abs_contrast = abs(contrast),
+      feature_type = "Protein"
+    ) %>%
+    dplyr::left_join(proteomics_property, by = c("feature_name" = "Assay")) %>%
+    dplyr::arrange(dplyr::desc(abs_contrast))
+}
+
+praxis_cluster_contrasts <- dplyr::bind_rows(
+  calculate_cluster_contrasts(SOLAR_praxis_df, SOLAR_cluster_assignments, "SOLAR"),
+  calculate_cluster_contrasts(CHS_praxis_df, CHS_praxis_transfer$assignments, "CHS"),
+  calculate_cluster_contrasts(BHRC_praxis_df, BHRC_praxis_transfer$assignments, "BHRC")
+)
+
+praxis_protein_ranks <- praxis_bf_top_features %>%
+  dplyr::filter(feature_type == "Protein") %>%
+  dplyr::group_by(cohort) %>%
+  dplyr::arrange(importance_rank, .by_group = TRUE) %>%
+  dplyr::mutate(cohort_rank = dplyr::row_number()) %>%
+  dplyr::ungroup() %>%
+  dplyr::left_join(
+    praxis_cluster_contrasts %>%
+      dplyr::select(cohort, feature_name, contrast, abs_contrast),
+    by = c("cohort", "feature_name")
+  )
+
+praxis_protein_ranks %>%
+  dplyr::group_by(cohort) %>%
+  dplyr::slice_min(cohort_rank, n = 20, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(cohort, cohort_rank, importance_value, feature_name, Protein, UniProt, contrast, abs_contrast) %>%
+  kableExtra::kbl(caption = "Top proteins by Praxis-BGM Bayes-factor feature importance.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+## Robust Rank Aggregation
+
+Robust Rank Aggregation tests whether proteins repeatedly appear near the top of the cohort-specific Praxis-BGM Bayes-factor rankings more often than expected by chance.
+Here, each cohort contributes one complete ranked list of all protein features used in Praxis-BGM, ordered from highest to lowest Bayes-factor importance.
+Lower RRA p-values indicate proteins with more consistent high ranks across SOLAR, CHS, and BHRC.
+
+```{r robust-rank-aggregation}
+if (!requireNamespace("RobustRankAggreg", quietly = TRUE)) {
+  stop(
+    "The 'RobustRankAggreg' package is required for Robust Rank Aggregation. ",
+    "Install it with install.packages('RobustRankAggreg')."
+  )
+}
+
+rra_ranked_lists <- praxis_protein_ranks %>%
+  dplyr::filter(!is.na(cohort_rank)) %>%
+  dplyr::mutate(cohort = factor(cohort, levels = c("SOLAR", "CHS", "BHRC"))) %>%
+  dplyr::arrange(cohort, cohort_rank) %>%
+  dplyr::group_by(cohort) %>%
+  dplyr::summarise(ranked_features = list(feature_name), .groups = "drop")
+
+rra_feature_lists <- rra_ranked_lists$ranked_features
+names(rra_feature_lists) <- as.character(rra_ranked_lists$cohort)
+
+rra_raw <- RobustRankAggreg::aggregateRanks(
+  glist = rra_feature_lists,
+  N = length(praxis_feature_names),
+  method = "RRA"
+)
+
+rra_results <- tibble::as_tibble(rra_raw)
+if (!"Name" %in% names(rra_results)) {
+  rra_results <- rra_raw %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("Name") %>%
+    tibble::as_tibble()
+}
+
+praxis_rra_results <- rra_results %>%
+  dplyr::rename(
+    feature_name = Name,
+    rra_p_value = Score
+  ) %>%
+  dplyr::mutate(rra_adjusted_pval_BH = stats::p.adjust(rra_p_value, method = "BH")) %>%
+  dplyr::left_join(proteomics_property, by = c("feature_name" = "Assay")) %>%
+  dplyr::left_join(
+    praxis_protein_ranks %>%
+      dplyr::select(cohort, feature_name, cohort_rank, importance_value) %>%
+      tidyr::pivot_wider(
+        names_from = cohort,
+        values_from = c(cohort_rank, importance_value),
+        names_glue = "{cohort}_{.value}"
+      ),
+    by = "feature_name"
+  ) %>%
+  dplyr::arrange(rra_p_value)
+
+praxis_rra_results %>%
+  dplyr::transmute(
+    `Olink assay` = feature_name,
+    `Protein name` = Protein,
+    `UniProt ID` = UniProt,
+    `RRA p-value` = scales::pvalue(rra_p_value, accuracy = 0.001),
+    `BH-adjusted RRA p-value` = scales::pvalue(rra_adjusted_pval_BH, accuracy = 0.001),
+    `SOLAR rank` = SOLAR_cohort_rank,
+    `CHS rank` = CHS_cohort_rank,
+    `BHRC rank` = BHRC_cohort_rank,
+    `SOLAR importance` = round(SOLAR_importance_value, 2),
+    `CHS importance` = round(CHS_importance_value, 2),
+    `BHRC importance` = round(BHRC_importance_value, 2)
+  ) %>%
+  dplyr::slice_head(n = 20) %>%
+  kableExtra::kbl(
+    caption = "Supplemental Table. Top proteins from Robust Rank Aggregation of Praxis-BGM protein importance rankings across SOLAR, CHS, and BHRC.",
+    align = c("l", "l", "l", rep("r", 8))
+  ) %>%
+  kableExtra::kable_paper("hover", full_width = FALSE) %>%
+  kableExtra::footnote(
+    general = paste(
+      "RRA, Robust Rank Aggregation; BH, Benjamini-Hochberg.",
+      "Praxis-BGM Bayes factors were used as model-based protein importance scores, with larger values indicating greater contribution to cluster discrimination.",
+      "Each cohort-specific rank is based on Praxis-BGM Bayes-factor feature importance, with rank 1 indicating the highest-ranked protein within that cohort.",
+      "Lower RRA p-values indicate proteins that appear near the top of cohort-specific rankings more consistently than expected by chance."
+    ),
+    general_title = "Note: ",
+    footnote_as_chunk = TRUE
+  )
+```
+
+## Marker protein Reactome annotation
+
+```{r marker-protein-reactome-annotation}
+marker_selected_features <- praxis_protein_ranks %>%
+  dplyr::filter(!is.na(importance_value), importance_value >= marker_bf_threshold) %>%
+  dplyr::mutate(
+    cohort = factor(cohort, levels = c("SOLAR", "CHS", "BHRC")),
+    display_name = dplyr::coalesce(Protein, feature_name)
+  ) %>%
+  dplyr::arrange(cohort, dplyr::desc(importance_value), cohort_rank) %>%
+  dplyr::mutate(display_name = factor(display_name, levels = unique(display_name))) %>%
+  dplyr::select(cohort, feature_name, display_name, cohort_rank, importance_value)
+
+if (nrow(marker_selected_features) > 0) {
+  marker_reactome_input <- marker_selected_features %>%
+    dplyr::transmute(
+      protein = feature_name,
+      protein_label = as.character(display_name)
+    ) %>%
+    dplyr::distinct()
+
+  marker_reactome_assignment <- annotate_reactome_pathways(
+    marker_reactome_input,
+    n_pathways_to_show = c(5, 10)
+  )
+
+  marker_reactome_pathways <- marker_reactome_assignment$pathways %>%
+    dplyr::distinct(protein, reactome_pathway_id, reactome_pathway) %>%
+    dplyr::mutate(
+      reactome_pathway = factor(reactome_pathway, levels = sort(unique(reactome_pathway)))
+    )
+
+  marker_reactome_pathway_colors <- make_reactome_pathway_colors(
+    levels(marker_reactome_pathways$reactome_pathway)
+  )
+
+  recurring_marker_labels <- marker_selected_features %>%
+    dplyr::count(feature_name, display_name) %>%
+    dplyr::filter(n > 1) %>%
+    dplyr::pull(display_name) %>%
+    as.character()
+
+  marker_reactome_pathways %>%
+    dplyr::count(reactome_pathway, name = "n_marker_proteins") %>%
+    dplyr::arrange(dplyr::desc(n_marker_proteins), reactome_pathway) %>%
+    kableExtra::kbl(caption = "Reactome pathway assignments for marker proteins.") %>%
+    kableExtra::kable_paper("hover", full_width = FALSE)
+} else {
+  marker_reactome_pathways <- tibble::tibble(
+    protein = character(),
+    reactome_pathway_id = character(),
+    reactome_pathway = factor(character())
+  )
+  marker_reactome_pathway_colors <- character()
+  recurring_marker_labels <- character()
+}
+```
+
+## Marker protein Bayes-factor plot
+
+```{r marker-protein-bayes-factor-plot, fig.width=10, fig.height=8}
+if (nrow(marker_selected_features) == 0) {
+  message(
+    "Skipping marker protein abundance plot: no proteins have Praxis-BGM ",
+    "Bayes-factor importance >= ", marker_bf_threshold, "."
+  )
+} else {
+  if (!requireNamespace("ggtext", quietly = TRUE)) {
+    stop(
+      "The 'ggtext' package is required for Reactome-colored y-axis labels. ",
+      "Install it with install.packages('ggtext')."
+    )
+  }
+
+  marker_abundance_df <- praxis_feature_df %>%
+    dplyr::select(cohort, participant_id, praxis_cluster, tidyselect::all_of(unique(marker_selected_features$feature_name))) %>%
+    tidyr::pivot_longer(
+      cols = tidyselect::all_of(unique(marker_selected_features$feature_name)),
+      names_to = "feature_name",
+      values_to = "protein_abundance"
+    ) %>%
+    dplyr::mutate(cohort = factor(cohort, levels = c("SOLAR", "CHS", "BHRC"))) %>%
+    dplyr::inner_join(
+      marker_selected_features %>%
+        dplyr::left_join(
+          marker_reactome_pathways,
+          by = c("feature_name" = "protein")
+        ),
+      by = c("cohort", "feature_name")
+    )
+
+  escape_markdown_label <- function(x) {
+    x %>%
+      stringr::str_replace_all("&", "&amp;") %>%
+      stringr::str_replace_all("<", "&lt;") %>%
+      stringr::str_replace_all(">", "&gt;")
+  }
+
+  marker_pathway_lookup <- marker_abundance_df %>%
+    dplyr::distinct(cohort, display_name, reactome_pathway) %>%
+    dplyr::mutate(
+      display_name = as.character(display_name),
+      legend_x = min(marker_abundance_df$protein_abundance, na.rm = TRUE)
+    )
+
+  format_marker_axis_labels <- function(x) {
+    label_text <- escape_markdown_label(x)
+    label_pathway <- marker_pathway_lookup$reactome_pathway[
+      match(x, marker_pathway_lookup$display_name)
+    ]
+    label_color <- marker_reactome_pathway_colors[as.character(label_pathway)]
+    label_color[is.na(label_color)] <- "grey30"
+    label_style <- dplyr::if_else(
+      x %in% recurring_marker_labels,
+      "font-style:italic;",
+      ""
+    )
+
+    paste0(
+      "<span style='color:", label_color, ";", label_style, "'>",
+      label_text,
+      "</span>"
+    )
+  }
+
+  marker_abundance_df %>%
+    ggplot2::ggplot(ggplot2::aes(x = protein_abundance, y = display_name, fill = praxis_cluster)) +
+    ggplot2::geom_boxplot(
+      width = 0.65,
+      outlier.size = 0.4,
+      outlier.alpha = 0.45
+    ) +
+    ggplot2::geom_point(
+      data = marker_pathway_lookup,
+      ggplot2::aes(x = legend_x, y = display_name, color = reactome_pathway),
+      inherit.aes = FALSE,
+      alpha = 0,
+      show.legend = TRUE
+    ) +
+    ggplot2::scale_fill_manual(values = praxis_cluster_colors) +
+    ggplot2::facet_wrap(~cohort, nrow = 1, scales = "free_y") +
+    ggplot2::scale_y_discrete(labels = format_marker_axis_labels) +
+    ggplot2::scale_color_manual(
+      values = marker_reactome_pathway_colors,
+      name = "Reactome pathway"
+    ) +
+    ggplot2::coord_cartesian(clip = "off") +
+    ggplot2::labs(
+      x = "Protein abundance (log2 normalized)",
+      y = NULL
+    ) +
+    ggplot2::guides(
+      color = ggplot2::guide_legend(
+        nrow = 3,
+        byrow = TRUE,
+        override.aes = list(alpha = 1, size = 2),
+        title.position = "top",
+        title.hjust = 0
+      ),
+      fill = "none"
+    ) +
+    praxis_plot_theme(legend.position = "bottom") +
+    ggplot2::theme(
+      axis.text.y = ggtext::element_markdown(size = 8),
+      legend.box.spacing = grid::unit(1, "pt"),
+      legend.margin = ggplot2::margin(0, 0, 0, 0),
+      legend.spacing.x = grid::unit(2, "pt"),
+      legend.key.height = grid::unit(8, "pt"),
+      plot.margin = ggplot2::margin(5.5, 5.5, 5.5, 5.5)
+    )
+}
+```
+
+```{r}
+ggsave(
+  filename = fs::path(
+    dir_figures,
+    "praxis_BGM_marker_protein.png"
+  ),
+  width = 7, height = 3, dpi = 600, units = "in"
+)
+```
+
+## Cross-cohort protein rank flow
+
+```{r top-protein-rank-flow-plot, fig.width=12, fig.height=7}
+rank_flow_proteins <- praxis_protein_ranks %>%
+  dplyr::filter(!is.na(importance_value), importance_value >= marker_bf_threshold) %>%
+  dplyr::pull(feature_name)
+
+if (length(rank_flow_proteins) == 0) {
+  message(
+    "Skipping cross-cohort protein rank flow: no proteins have Praxis-BGM ",
+    "Bayes-factor importance >= ", marker_bf_threshold, "."
+  )
+} else {
+  rank_flow_df <- praxis_protein_ranks %>%
+    dplyr::filter(feature_name %in% unique(rank_flow_proteins)) %>%
+    dplyr::left_join(
+      marker_reactome_pathways,
+      by = c("feature_name" = "protein")
+    ) %>%
+    dplyr::mutate(
+      cohort = factor(cohort, levels = c("SOLAR", "CHS", "BHRC")),
+      reactome_pathway = factor(
+        reactome_pathway,
+        levels = names(marker_reactome_pathway_colors)
+      ),
+      x_position = dplyr::case_when(
+        cohort == "SOLAR" ~ 0,
+        cohort == "CHS" ~ 2,
+        cohort == "BHRC" ~ 4
+      ),
+      display_name = dplyr::coalesce(Protein, feature_name),
+      rank_label = paste0(cohort_rank, "  ", display_name)
+    ) %>%
+    dplyr::group_by(cohort) %>%
+    dplyr::arrange(cohort_rank, .by_group = TRUE) %>%
+    dplyr::mutate(plot_rank = dplyr::row_number()) %>%
+    dplyr::ungroup()
+
+  rank_flow_segments <- rank_flow_df %>%
+    dplyr::arrange(feature_name, cohort) %>%
+    dplyr::group_by(feature_name) %>%
+    dplyr::mutate(
+      xend_position = dplyr::lead(x_position),
+      plot_rank_end = dplyr::lead(plot_rank)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(!is.na(xend_position), !is.na(plot_rank_end))
+
+  rank_flow_max_rank <- max(rank_flow_df$plot_rank, na.rm = TRUE)
+
+  ggplot2::ggplot() +
+    ggplot2::geom_segment(
+      data = rank_flow_segments,
+      ggplot2::aes(
+        x = x_position + 0.46,
+        xend = xend_position - 0.46,
+        y = -plot_rank,
+        yend = -plot_rank_end
+      ),
+      color = "grey55",
+      linewidth = 0.35,
+      alpha = 0.75
+    ) +
+    ggplot2::geom_tile(
+      data = rank_flow_df,
+      ggplot2::aes(x = x_position, y = -plot_rank, fill = reactome_pathway),
+      width = 0.82,
+      height = 0.78,
+      color = "grey70",
+      linewidth = 0.2
+    ) +
+    ggplot2::geom_text(
+      data = rank_flow_df,
+      ggplot2::aes(x = x_position, y = -plot_rank, label = rank_label),
+      color = "white",
+      size = 3
+    ) +
+    ggplot2::annotate("text", x = 0, y = 0, label = "SOLAR", fontface = "plain", size = 3.1) +
+    ggplot2::annotate("text", x = 2, y = 0, label = "CHS", fontface = "plain", size = 3.1) +
+    ggplot2::annotate("text", x = 4, y = 0, label = "BHRC", fontface = "plain", size = 3.1) +
+    ggplot2::annotate(
+      "text",
+      x = 2,
+      y = -rank_flow_max_rank - 1.1,
+      label = "Cross-cohort protein rank flow by Bayes-factor importance",
+      size = 3.1
+    ) +
+    ggplot2::scale_fill_manual(
+      values = marker_reactome_pathway_colors,
+      name = "Reactome pathway",
+      drop = FALSE
+    ) +
+    ggplot2::guides(
+      fill = ggplot2::guide_legend(
+        nrow = 3,
+        byrow = TRUE,
+        title.position = "top",
+        title.hjust = 0
+      )
+    ) +
+    ggplot2::coord_cartesian(
+      xlim = c(-0.5, 4.5),
+      ylim = c(-rank_flow_max_rank - 1.6, 0.6),
+      clip = "off"
+    ) +
+    ggplot2::theme_void(base_size = 9) +
+    ggplot2::theme(
+      legend.position = "bottom",
+      legend.box.spacing = grid::unit(1, "pt"),
+      legend.margin = ggplot2::margin(0, 0, 0, 0),
+      legend.spacing.x = grid::unit(2, "pt"),
+      legend.key.height = grid::unit(8, "pt"),
+      legend.title = ggplot2::element_text(size = 9),
+      legend.text = ggplot2::element_text(size = 9),
+      plot.margin = ggplot2::margin(0, 5, 0, 0),
+      text = ggplot2::element_text(size = 9)
+    )
+}
+```
+
+```{r}
+ggsave(
+  filename = fs::path(
+    dir_figures,
+    "praxis_BGM_protein_rank_flow.png"
+  ),
+  width = 6, height = 3.5, units = "in"
+)
+```
+
+## Cross-cohort protein rank bump chart
+
+```{r protein-rank-bump-chart, fig.width=7, fig.height=4.5}
+bump_chart_proteins <- praxis_protein_ranks %>%
+  dplyr::filter(!is.na(importance_value), importance_value >= marker_bf_threshold) %>%
+  dplyr::distinct(feature_name)
+
+if (nrow(bump_chart_proteins) == 0) {
+  message(
+    "Skipping cross-cohort protein rank bump chart: no proteins have Praxis-BGM ",
+    "Bayes-factor importance >= ", marker_bf_threshold, "."
+  )
+} else {
+  bump_chart_df <- praxis_protein_ranks %>%
+    dplyr::semi_join(bump_chart_proteins, by = "feature_name") %>%
+    dplyr::left_join(
+      marker_reactome_pathways,
+      by = c("feature_name" = "protein")
+    ) %>%
+    dplyr::mutate(
+      cohort = factor(cohort, levels = c("SOLAR", "CHS", "BHRC")),
+      cohort_x = as.numeric(cohort) + 0.65,
+      display_name = dplyr::coalesce(Protein, feature_name),
+      reactome_pathway = factor(
+        reactome_pathway,
+        levels = names(marker_reactome_pathway_colors)
+      )
+    ) %>%
+    dplyr::group_by(feature_name) %>%
+    dplyr::filter(dplyr::n_distinct(cohort_rank[!is.na(cohort_rank)]) > 1) %>%
+    dplyr::ungroup() %>%
+    dplyr::group_by(cohort) %>%
+    dplyr::arrange(cohort_rank, .by_group = TRUE) %>%
+    dplyr::mutate(plot_rank = dplyr::row_number()) %>%
+    dplyr::ungroup()
+
+  if (nrow(bump_chart_df) == 0) {
+    message("Skipping cross-cohort protein rank bump chart: selected protein ranks do not change across cohorts.")
+  } else {
+    bump_chart_labels <- bump_chart_df %>%
+      dplyr::filter(cohort == "SOLAR") %>%
+      dplyr::arrange(cohort_rank) %>%
+      dplyr::distinct(feature_name, .keep_all = TRUE)
+
+    protein_rank_bump_chart <- bump_chart_df %>%
+      ggplot2::ggplot(
+        ggplot2::aes(
+          x = cohort_x,
+          y = -plot_rank,
+          group = feature_name,
+          color = reactome_pathway
+        )
+      ) +
+      ggplot2::geom_line(linewidth = 0.45, alpha = 0.8) +
+      ggplot2::geom_point(size = 1.8, alpha = 0.95) +
+      ggplot2::geom_text(
+        data = bump_chart_labels,
+        ggplot2::aes(x = 1.48, y = -plot_rank, label = display_name),
+        inherit.aes = FALSE,
+        hjust = 1,
+        size = 2.6,
+        color = "black",
+        check_overlap = TRUE
+      ) +
+      ggplot2::annotate(
+        "text",
+        x = seq_along(cohort_names) + 0.65,
+        y = 0,
+        label = cohort_names,
+        size = 3,
+        color = "black"
+      ) +
+      ggplot2::scale_x_continuous(
+        limits = c(0.2, length(cohort_names) + 0.85),
+        expand = ggplot2::expansion(mult = 0)
+      ) +
+      ggplot2::scale_color_manual(
+        values = marker_reactome_pathway_colors,
+        name = "Reactome pathway",
+        na.value = "grey60",
+        drop = FALSE
+      ) +
+      ggplot2::coord_cartesian(
+        ylim = c(-max(bump_chart_df$plot_rank, na.rm = TRUE) - 0.4, 0.4),
+        clip = "off"
+      ) +
+      ggplot2::guides(
+        color = ggplot2::guide_legend(
+          nrow = 3,
+          byrow = TRUE,
+          title.position = "top",
+          title.hjust = 0
+        )
+      ) +
+      ggplot2::theme_void(base_size = 9) +
+      ggplot2::theme(
+        legend.position = "bottom",
+        legend.box.spacing = grid::unit(1, "pt"),
+        legend.margin = ggplot2::margin(0, 0, 0, 0),
+        legend.spacing.x = grid::unit(2, "pt"),
+        legend.key.height = grid::unit(8, "pt"),
+        legend.title = ggplot2::element_text(size = 10, color = "black"),
+        legend.text = ggplot2::element_text(size = 10, color = "black"),
+        text = ggplot2::element_text(color = "black"),
+        plot.margin = ggplot2::margin(0, 0, 0, 0)
+      )
+
+    protein_rank_bump_chart
+  }
+}
+```
+
+```{r}
+if (exists("protein_rank_bump_chart")) {
+  ggsave(
+    plot = protein_rank_bump_chart,
+    filename = fs::path(
+      dir_figures,
+      "praxis_BGM_protein_rank_bump_chart.png"
+    ),
+    width = 7, height = 3.5, dpi = 600, units = "in"
+  )
+}
+```

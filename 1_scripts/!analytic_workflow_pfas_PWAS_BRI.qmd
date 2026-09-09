@@ -1,0 +1,553 @@
+---
+title: "PFAS and Proteomics in BRI"
+author: "Zhenjiang Li"
+date: today
+toc: true
+toc_expand: 2
+format:
+  html:
+    code-fold: true
+    html-math-method: katex
+    fontsize: 16pt
+    grid:
+      sidebar-width: 0px
+      body-width: 1500px
+      margin-width: 500px
+      gutter-width: 1.5rem
+embed-resources: true
+editor: visual
+editor_options:
+  chunk_output_type: console
+---
+
+## Environment Setup {.hidden}
+
+```{=html}
+<style type="text/css">
+caption, .table-caption {
+  text-align: left;
+}
+</style>
+```
+
+```{r setup}
+#| echo: false
+
+options(scipen = 999)
+
+library(fs)
+library(here)
+i_am("1_scripts/!analytic_workflow_pfas_PWAS_BRI.qmd")
+
+source(here::here("1_scripts", "!libraries.R"))
+source(here::here("1_scripts", "!directories.R"))
+source(here::here("1_scripts", "!functions.R"))
+
+options(knitr.table.format = "html")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r shorten-long-path}
+#| include: false
+
+create_shortcut <- function(path, short_cut, drive) {
+  return(
+    sub(gsub("\\)", "\\\\)", gsub("\\(", "\\\\(", short_cut)), paste0(drive, ":"), path)
+  )
+}
+
+if (nchar(dir_data) > 80) {
+  system("subst x: /D")
+  short_cut <- dir_home |> dirname()
+  system(paste0("subst x: \"", short_cut, "\""))
+
+  dir_objects_names <- ls(pattern = "^dir_")
+  dir_list <- mget(dir_objects_names)
+
+  dir_list_shortened <- lapply(
+    dir_list,
+    function(y) create_shortcut(y, short_cut, "x")
+  )
+  list2env(dir_list_shortened, envir = .GlobalEnv)
+}
+
+rm(list = intersect(
+  c("dir_objects_names", "short_cut", "dir_list", "dir_list_shortened"),
+  ls()
+))
+```
+
+# Parameters
+
+```{r parameters}
+BRI_pfas_names <- c(
+  "pfas_pfos_log2",
+  "pfas_pfoa_log2",
+  "pfas_pfna_log2",
+  "pfas_pfda_log2",
+  "pfas_pfhxs_log2",
+  "pfas_pfhps_log2"
+)
+PFAS_abbrev_names <- c("PFOS", "PFOA", "PFNA", "PFDA", "PFHxS", "PFHpS")
+
+BRI_covars <- c("baseline_age", "sex", "hispanic", "race_cat")
+BRI_age_group_levels <- c("25-35", "55-65")
+BRI_min_protein_presence <- 0.80
+
+dir_pwas_bri <- fs::path(dir_temp_data, "PFAS_PWAS_BRI")
+fs::dir_create(dir_pwas_bri)
+```
+
+# Sound Life Project
+
+The Sound Life Project is designed to understand immune system diversity and how variation among healthy immune systems may influence responses to infection, vaccination, and other immune challenges.
+Conducted in collaboration with [Jane Buckner, MD](https://www.benaroyaresearch.org/about-bri/faculty-scientific-staff/jane-buckner), the study enrolled adults with no known chronic diseases across two age-based cohorts: adults ages 25-35 and adults ages 55-65.
+
+Participants completed repeated study visits over two years with health and lifestyle surveys, standard clinical testing, and deep immunological profiling.
+For this validation analysis, baseline BRI SLP PFAS and Olink protein data are used to test whether the six common PFAS analytes from the SOLAR, CHS, and BHRC PWAS show protein associations within each baseline age cohort.
+
+# Data Preparation
+
+## Bridged proteomics annotation
+
+```{r bridged-proteomics-annotation}
+proteomics_l <- readRDS(fs::path(
+  dir_data,
+  "ShARP_BHRC_Shared",
+  "ShARP_BHRC_Data_Shared",
+  "OLINK_proteomics_bridged_BHRC_SOLAR_CHS.rds"
+))
+
+cohort_names <- c("SOLAR", "CHS", "BHRC")
+proteomics_metadata_cols <- c("LABID", "study", "Batch")
+
+overlap_proteins <- proteomics_l[cohort_names] %>%
+  purrr::map(~ setdiff(names(.x), proteomics_metadata_cols)) %>%
+  purrr::reduce(intersect)
+
+proteomics_property <- proteomics_l$protein_annotation$SOLAR %>%
+  dplyr::filter(meta_id %in% overlap_proteins) %>%
+  dplyr::transmute(
+    OlinkID = meta_id,
+    UniProt = meta_Uniprot,
+    Assay = meta_Assay,
+    Protein = meta_Assay,
+    Panel = NA_character_
+  )
+```
+
+## BRI SLP baseline data
+
+```{r bri-slp-data-prep}
+bri_slp <- readRDS(
+  fs::path(
+    dir_slp_data,
+    "bri_cleaned_data.rds"
+  )
+)
+
+bri_slp_baseline_raw <- bri_slp$baseline_data
+bri_slp_pfas <- bri_slp$pfas_data
+bri_slp_protein_metadata <- bri_slp$protein_metadata
+
+if (is.null(bri_slp_protein_metadata)) {
+  bri_slp_protein_metadata <- bri_slp$proteomics_metadata
+}
+
+if (is.null(bri_slp_protein_metadata)) {
+  stop("Missing BRI protein metadata. Expected `protein_metadata` or `proteomics_metadata` in bri_cleaned_data.rds.")
+}
+
+missing_bri_pfas <- setdiff(c("subject_id", BRI_pfas_names), names(bri_slp_pfas))
+if (length(missing_bri_pfas) > 0) {
+  stop("Missing expected BRI PFAS columns: ", paste(missing_bri_pfas, collapse = ", "))
+}
+
+protein_feature_map <- proteomics_property %>%
+  dplyr::mutate(OlinkID_component = stringr::str_extract_all(OlinkID, "OID[0-9]+")) %>%
+  tidyr::unnest_longer(OlinkID_component) %>%
+  dplyr::inner_join(
+    bri_slp_protein_metadata %>%
+      dplyr::transmute(
+        OlinkID_component = olink_id,
+        BRI_feature_name = olink_variable,
+        BRI_Panel = panel,
+        BRI_missing_freq = missing_freq,
+        BRI_assay_warning = assay_warning,
+        BRI_qc_warning = qc_warning
+      ),
+    by = "OlinkID_component"
+  ) %>%
+  dplyr::filter(BRI_feature_name %in% names(bri_slp_baseline_raw)) %>%
+  dplyr::distinct(BRI_feature_name, .keep_all = TRUE)
+
+BRI_protein_presence <- protein_feature_map %>%
+  dplyr::transmute(
+    BRI_feature_name,
+    n_present = purrr::map_int(BRI_feature_name, ~ sum(!is.na(bri_slp_baseline_raw[[.x]]))),
+    n_total = nrow(bri_slp_baseline_raw),
+    present_prop = n_present / n_total
+  )
+
+protein_feature_map <- protein_feature_map %>%
+  dplyr::left_join(BRI_protein_presence, by = "BRI_feature_name") %>%
+  dplyr::filter(present_prop >= BRI_min_protein_presence)
+
+BRI_protein_names <- protein_feature_map$BRI_feature_name
+
+bri_slp_baseline <- bri_slp_baseline_raw %>%
+  dplyr::select(-tidyselect::any_of(BRI_pfas_names)) %>%
+  dplyr::inner_join(
+    bri_slp_pfas %>%
+      dplyr::select(subject_id, tidyselect::all_of(BRI_pfas_names)),
+    by = "subject_id"
+  ) %>%
+  dplyr::mutate(
+    baseline_age = as.numeric(baseline_age),
+    sex = as.factor(sex),
+    hispanic = as.factor(hispanic),
+    race_cat = as.factor(race_cat),
+    baseline_age_group = dplyr::case_when(
+      baseline_age >= 25 & baseline_age < 36 ~ "25-35",
+      baseline_age >= 55 & baseline_age < 66 ~ "55-65",
+      TRUE ~ NA_character_
+    ),
+    baseline_age_group = factor(baseline_age_group, levels = BRI_age_group_levels)
+  ) %>%
+  dplyr::select(
+    subject_id,
+    baseline_age_group,
+    tidyselect::all_of(BRI_covars),
+    tidyselect::all_of(BRI_pfas_names),
+    tidyselect::all_of(BRI_protein_names)
+  )
+
+cat("BRI proteins overlapping SOLAR, CHS, and BHRC protein annotation after 80% presence QC:", length(BRI_protein_names), "\n")
+cat("BRI baseline participants with PFAS data:", nrow(bri_slp_baseline), "\n")
+colSums(is.na(bri_slp_baseline[, c(BRI_pfas_names, BRI_covars, "baseline_age_group")]))
+dim(bri_slp_baseline)
+```
+
+# Table 1
+
+```{r table1}
+table1::table1(
+  ~ baseline_age + sex + hispanic + race_cat | baseline_age_group,
+  data = bri_slp_baseline
+)
+
+pfas_summary_by_group <- function(df, group, pfas_names) {
+  pfas_name_map <- stats::setNames(pfas_names, PFAS_abbrev_names)
+
+  df %>%
+    dplyr::select(tidyselect::all_of(pfas_names)) %>%
+    dplyr::rename(tidyselect::all_of(pfas_name_map)) %>%
+    tidyr::pivot_longer(
+      cols = tidyselect::all_of(PFAS_abbrev_names),
+      names_to = "PFAS",
+      values_to = "log2_value"
+    ) %>%
+    dplyr::mutate(
+      concentration = 2^log2_value
+    ) %>%
+    dplyr::group_by(PFAS) %>%
+    dplyr::summarise(
+      analysis_group = group,
+      median = stats::median(concentration, na.rm = TRUE),
+      q1 = stats::quantile(concentration, probs = 0.25, na.rm = TRUE, names = FALSE),
+      q3 = stats::quantile(concentration, probs = 0.75, na.rm = TRUE, names = FALSE),
+      .groups = "drop"
+    )
+}
+
+pfas_concentration_table1 <- dplyr::bind_rows(
+  pfas_summary_by_group(
+    bri_slp_baseline %>% dplyr::filter(baseline_age_group == "25-35"),
+    "Age 25-35",
+    BRI_pfas_names
+  ),
+  pfas_summary_by_group(
+    bri_slp_baseline %>% dplyr::filter(baseline_age_group == "55-65"),
+    "Age 55-65",
+    BRI_pfas_names
+  )
+) %>%
+  dplyr::mutate(
+    PFAS = factor(PFAS, levels = PFAS_abbrev_names),
+    median_iqr = sprintf("%.2f (%.2f, %.2f)", median, q1, q3)
+  ) %>%
+  dplyr::select(PFAS, analysis_group, median_iqr) %>%
+  tidyr::pivot_wider(names_from = analysis_group, values_from = median_iqr) %>%
+  dplyr::arrange(PFAS)
+
+pfas_concentration_table1 %>%
+  kableExtra::kbl(
+    caption = "BRI SLP common PFAS concentrations, median (Q1, Q3), original concentration scale."
+  ) %>%
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+# PWAS
+
+This section performs BRI SLP validation analyses for the six PFAS compounds common to SOLAR, CHS, and BHRC.
+First, each PFAS compound is tested separately against every overlapping BRI protein using linear regression with covariate adjustment for baseline age and sex.
+Second, the six PFAS compounds are tested jointly using an omnibus nested linear-model test comparing covariate-only and covariate-plus-PFAS models.
+Both analyses are run separately within the two baseline age cohorts.
+
+## Analysis Helpers
+
+```{r pwas-helpers}
+prepare_pwas_df <- function(df, id_col, pfas_names, covars, protein_names) {
+  df %>%
+    dplyr::select(
+      tidyselect::all_of(id_col),
+      tidyselect::any_of("baseline_age_group"),
+      tidyselect::all_of(pfas_names),
+      tidyselect::all_of(covars),
+      tidyselect::all_of(protein_names)
+    ) %>%
+    dplyr::filter(
+      stats::complete.cases(dplyr::select(., tidyselect::all_of(c(pfas_names, covars))))
+    )
+}
+
+annotate_single_pfas_results <- function(res, cohort, analysis_group, pfas_var, pfas_names) {
+  res %>%
+    dplyr::mutate(
+      cohort = cohort,
+      analysis_group = analysis_group,
+      pfas = pfas_var,
+      pfas_abbrev = PFAS_abbrev_names[match(pfas_var, pfas_names)],
+      adjusted_pval_BH = stats::p.adjust(p_value, method = "BH"),
+      adjusted_pval_BY = stats::p.adjust(p_value, method = "BY"),
+      estimate_beta = estimate,
+      se_beta = se,
+      ci_beta_low = estimate_beta - 1.96 * se_beta,
+      ci_beta_high = estimate_beta + 1.96 * se_beta
+    )
+}
+
+empty_lm_result <- function(feature_name, term = NA_character_, n_complete = 0L) {
+  tibble::tibble(
+    var_name = term,
+    feature_name = feature_name,
+    estimate = NA_real_,
+    se = NA_real_,
+    test_statistic = NA_real_,
+    p_value = NA_real_,
+    n_complete = n_complete
+  )
+}
+
+fit_single_pfas_lm <- function(df, pfas_var, covars, protein_name) {
+  model_df <- df %>%
+    dplyr::select(tidyselect::all_of(c(protein_name, pfas_var, covars))) %>%
+    stats::na.omit()
+
+  if (nrow(model_df) <= length(c(pfas_var, covars))) {
+    return(empty_lm_result(protein_name, pfas_var, nrow(model_df)))
+  }
+
+  fit <- stats::lm(
+    stats::reformulate(c(covars, pfas_var), response = protein_name),
+    data = model_df
+  )
+  coef_summary <- summary(fit)$coefficients
+
+  if (!pfas_var %in% rownames(coef_summary)) {
+    return(empty_lm_result(protein_name, pfas_var, nrow(model_df)))
+  }
+
+  tibble::tibble(
+    var_name = pfas_var,
+    feature_name = protein_name,
+    estimate = unname(coef_summary[pfas_var, "Estimate"]),
+    se = unname(coef_summary[pfas_var, "Std. Error"]),
+    test_statistic = unname(coef_summary[pfas_var, "t value"]),
+    p_value = unname(coef_summary[pfas_var, "Pr(>|t|)"]),
+    n_complete = nrow(model_df)
+  )
+}
+
+fit_pfas_mixture_lm <- function(df, pfas_names, covars, protein_name) {
+  model_df <- df %>%
+    dplyr::select(tidyselect::all_of(c(protein_name, pfas_names, covars))) %>%
+    stats::na.omit()
+
+  if (nrow(model_df) <= length(c(pfas_names, covars))) {
+    return(
+      tibble::tibble(
+        feature_name = protein_name,
+        test_statistic = NA_real_,
+        p_value = NA_real_,
+        df_num = NA_real_,
+        df_den = NA_real_,
+        n_complete = nrow(model_df)
+      )
+    )
+  }
+
+  reduced_fit <- stats::lm(
+    stats::reformulate(covars, response = protein_name),
+    data = model_df
+  )
+  full_fit <- stats::lm(
+    stats::reformulate(c(covars, pfas_names), response = protein_name),
+    data = model_df
+  )
+  model_comparison <- stats::anova(reduced_fit, full_fit)
+
+  tibble::tibble(
+    feature_name = protein_name,
+    test_statistic = unname(model_comparison$F[2]),
+    p_value = unname(model_comparison$`Pr(>F)`[2]),
+    df_num = unname(model_comparison$Df[2]),
+    df_den = unname(stats::df.residual(full_fit)),
+    n_complete = nrow(model_df)
+  )
+}
+
+annotate_bri_protein_results <- function(res) {
+  res %>%
+    dplyr::left_join(protein_feature_map, by = c("feature_name" = "BRI_feature_name")) %>%
+    dplyr::relocate(
+      cohort,
+      analysis_group,
+      pfas,
+      pfas_abbrev,
+      feature_name,
+      Protein,
+      UniProt,
+      OlinkID,
+      Assay,
+      Panel,
+      .before = estimate_beta
+    )
+}
+
+run_bri_single_pwas <- function(df, analysis_group, pfas_names, covars, protein_names) {
+  purrr::map_dfr(
+    pfas_names,
+    function(pfas_var) {
+      purrr::map_dfr(
+        protein_names,
+        ~ fit_single_pfas_lm(df, pfas_var, covars, .x)
+      ) %>%
+        annotate_single_pfas_results("BRI_SLP", analysis_group, pfas_var, pfas_names)
+    }
+  ) %>%
+    annotate_bri_protein_results()
+}
+
+run_bri_mixture_pwas <- function(df, analysis_group, pfas_names, covars, protein_names) {
+  purrr::map_dfr(
+    protein_names,
+    ~ fit_pfas_mixture_lm(df, pfas_names, covars, .x)
+  ) %>%
+    dplyr::mutate(
+      cohort = "BRI_SLP",
+      analysis_group = analysis_group,
+      mixture = "PFAS mixture",
+      pfas = "PFAS mixture",
+      pfas_abbrev = "PFAS mixture",
+      adjusted_pval_BH = stats::p.adjust(p_value, method = "BH"),
+      adjusted_pval_BY = stats::p.adjust(p_value, method = "BY"),
+      estimate_beta = NA_real_,
+      ci_beta_low = NA_real_,
+      ci_beta_high = NA_real_
+    ) %>%
+    annotate_bri_protein_results() %>%
+    dplyr::relocate(mixture, .after = analysis_group)
+}
+```
+
+## Complete-Case PWAS Inputs
+
+```{r pwas-inputs}
+BRI_pwas_df <- bri_slp_baseline %>%
+  prepare_pwas_df("subject_id", BRI_pfas_names, BRI_covars, BRI_protein_names)
+
+BRI_pwas_by_age <- BRI_age_group_levels %>%
+  stats::setNames(BRI_age_group_levels) %>%
+  purrr::map(
+    ~ BRI_pwas_df %>%
+      dplyr::filter(baseline_age_group == .x)
+  )
+
+tibble::tibble(
+  analysis_group = paste("Age", BRI_age_group_levels),
+  n_participants = purrr::map_int(BRI_pwas_by_age, nrow),
+  n_pfas = length(PFAS_abbrev_names),
+  n_proteins = length(BRI_protein_names)
+) %>%
+  kableExtra::kbl(caption = "Complete-case BRI SLP PWAS input dimensions.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+## Single-PFAS PWAS
+
+```{r single-pfas-pwas}
+BRI_age_PWAS_results <- purrr::imap_dfr(
+  BRI_pwas_by_age,
+  ~ run_bri_single_pwas(
+    df = .x,
+    analysis_group = paste("Age", .y),
+    pfas_names = BRI_pfas_names,
+    covars = BRI_covars,
+    protein_names = BRI_protein_names
+  )
+)
+
+BRI_single_PWAS_results <- BRI_age_PWAS_results
+
+readr::write_csv(
+  BRI_single_PWAS_results,
+  fs::path(dir_pwas_bri, "BRI_SLP_single_PFAS_PWAS_results.csv")
+)
+
+BRI_single_PWAS_results %>%
+  dplyr::group_by(analysis_group, pfas_abbrev) %>%
+  dplyr::summarise(
+    n_nominal_p_lt_0.05 = sum(p_value < 0.05, na.rm = TRUE),
+    n_BH_p_lt_0.05 = sum(adjusted_pval_BH < 0.05, na.rm = TRUE),
+    n_BY_p_lt_0.05 = sum(adjusted_pval_BY < 0.05, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(analysis_group, pfas_abbrev) %>%
+  kableExtra::kbl(caption = "BRI SLP single-PFAS PWAS significant association counts.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```
+
+## PFAS-Mixture PWAS
+
+```{r mixture-pfas-pwas}
+BRI_age_mixture_PWAS_results <- purrr::imap_dfr(
+  BRI_pwas_by_age,
+  ~ run_bri_mixture_pwas(
+    df = .x,
+    analysis_group = paste("Age", .y),
+    pfas_names = BRI_pfas_names,
+    covars = BRI_covars,
+    protein_names = BRI_protein_names
+  )
+)
+
+BRI_mixture_PWAS_results <- BRI_age_mixture_PWAS_results
+
+readr::write_csv(
+  BRI_mixture_PWAS_results,
+  fs::path(dir_pwas_bri, "BRI_SLP_mixture_lm_omnibus_PWAS_results.csv")
+)
+
+BRI_mixture_PWAS_results %>%
+  dplyr::group_by(analysis_group, mixture) %>%
+  dplyr::summarise(
+    n_nominal_p_lt_0.05 = sum(p_value < 0.05, na.rm = TRUE),
+    n_BH_p_lt_0.05 = sum(adjusted_pval_BH < 0.05, na.rm = TRUE),
+    n_BY_p_lt_0.05 = sum(adjusted_pval_BY < 0.05, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(analysis_group) %>%
+  kableExtra::kbl(caption = "BRI SLP PFAS-mixture linear-model omnibus PWAS significant association counts.") %>%
+  kableExtra::kable_paper("hover", full_width = FALSE)
+```

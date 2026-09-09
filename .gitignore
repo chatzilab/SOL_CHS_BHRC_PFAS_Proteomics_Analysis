@@ -1,0 +1,35 @@
+# Do not track data files
+0_data/**
+!0_data/.gitkeep
+
+# Do not track archive folders anywhere
+**/archives/
+**/archive/
+
+# R / analysis outputs
+*.RData
+*.rds
+*.RDS
+*.rda
+*.Rhistory
+*.Rproj.user/
+
+# Office/temp files
+~$*
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Ignore all figures except selected manuscript figures
+3_figures/**
+!3_figures/
+!3_figures/PFAS_final_validation_candidate_PWAS_heatmap_with_meta_analysis.png
+!3_figures/PFAS_proteomics_lifecourse (3).png
+!3_figures/praxis_BGM_marker_protein.png
+!3_figures/praxis_BGM_pfas_profiles.png
+!3_figures/praxis_BGM_protein_rank_bump_chart.png
+!3_figures/praxis_BGM_UMAP.png
+!3_figures/Sig_modules_circular_plots.png
+!3_figures/SOLAR_ref_module_pathway_analysis.png
