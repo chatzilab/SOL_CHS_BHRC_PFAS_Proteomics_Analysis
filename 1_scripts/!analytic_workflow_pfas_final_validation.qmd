@@ -631,6 +631,11 @@ pwas_candidate_meta_effects <- pwas_candidate_effects %>%
   ) %>%
   dplyr::arrange(display_label, pfas_abbrev)
 
+readr::write_csv(
+  pwas_candidate_meta_effects,
+  fs::path(dir_validation, "PFAS_validation_candidate_PWAS_meta_effects.csv")
+)
+
 pwas_candidate_meta_effects %>%
   dplyr::select(
     display_label,
@@ -929,5 +934,70 @@ ggplot2::ggsave(
   units = "in",
   width = 8,
   height = 6
+)
+```
+
+# Supplementary Data 1 Export
+
+This optional export creates an Excel workbook with one sheet for each cohort or SLP age group and one sheet for the fixed-effect meta-analysis results.
+
+```{r supplementary-data-1-export}
+#| eval: false
+
+if (!requireNamespace("openxlsx", quietly = TRUE)) {
+  stop("Package 'openxlsx' is required to write Supplementary Data 1.")
+}
+
+supplementary_data_1_file <- fs::path(
+  dir_temp_data,
+  "Supplementary_Data_1_PFAS_protein_associations.xlsx"
+)
+
+supplementary_data_1_cohort_sheets <- validation_cohort_levels %>%
+  rlang::set_names() %>%
+  purrr::map(~ pwas_candidate_effects %>%
+    dplyr::filter(as.character(analysis_group) == .x) %>%
+    dplyr::mutate(
+      analysis_group = as.character(analysis_group),
+      pfas_abbrev = as.character(pfas_abbrev)
+    ) %>%
+    dplyr::arrange(display_label, pfas_abbrev)
+  )
+
+supplementary_data_1_sheets <- c(
+  supplementary_data_1_cohort_sheets,
+  list(
+    `Meta-analysis` = pwas_candidate_meta_effects %>%
+      dplyr::mutate(
+        analysis_group = as.character(analysis_group),
+        pfas_abbrev = as.character(pfas_abbrev)
+      )
+  )
+)
+
+supplementary_data_1_sheets <- supplementary_data_1_sheets %>%
+  purrr::map(~ .x %>%
+    dplyr::arrange(display_label, pfas_abbrev) %>%
+    dplyr::select(
+      cohort,
+      OlinkID,
+      Protein,
+      UniProt,
+      pfas_abbrev,
+      estimate_beta_log2,
+      se_beta,
+      ci_beta_low,
+      ci_beta_high,
+      p_value,
+      adjusted_pval_BH,
+      tidyselect::any_of("meta_n"),
+      selection_sources
+    )
+  )
+
+openxlsx::write.xlsx(
+  supplementary_data_1_sheets,
+  file = supplementary_data_1_file,
+  overwrite = TRUE
 )
 ```
